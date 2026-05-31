@@ -1,14 +1,14 @@
 ---
 name: telegram
 description: >
-  Send Telegram messages to the user and have a two-way chat with them while away
-  from the terminal — without any blocking hook. Three uses: (1) notify when a
-  task/research finishes ("напиши в тг как закончишь", "ping me on telegram when
-  done"); (2) two-way chat over Telegram, driven by a non-blocking cron poll loop
-  ("обсудим в тг", "let's discuss on telegram", "I'm stepping away"); (3) end it
-  ("я вернулась", "я в терминале", "I'm back", "/stop"). Also auto-mirrors the last
-  message to Telegram after ~10 min of no terminal reply. Works across multiple
-  concurrent Claude sessions sharing one bot. Uses a bot token; no daemon.
+  Send Telegram messages to the user and hold a two-way chat with them while away
+  from the terminal — non-blocking, with every active session always listening.
+  Uses: (1) notify when a task/research finishes ("напиши в тг как закончишь",
+  "ping me on telegram when done"); (2) two-way chat any time — the user messages a
+  session over Telegram and it replies, addressing a session by replying to its
+  message; (3) auto-mirror the last message to Telegram after ~10 min of no terminal
+  reply. Works across multiple concurrent sessions sharing one bot, coordinated by a
+  file lock so only one polls Telegram at a time. Bot token only; no daemon.
 ---
 
 # Telegram bridge
@@ -18,10 +18,34 @@ routing/locking lives in `bridge.py`. Use absolute paths under
 `~/.claude/skills/telegram/`. Token + chat_id + allowed user_id live in
 `config.json` (chmod 600, never printed).
 
-**Nothing here ever blocks the terminal.** Hooks (Stop / Notification /
-UserPromptSubmit, already wired in `~/.claude/settings.json`) only do cheap,
-non-blocking side effects. Two-way conversation is driven by *you* (the agent) with
-a `CronCreate` poll loop — see Mode 2.
+**Nothing here blocks the terminal.** Listening uses a background task that costs no
+model tokens while idle — you only wake when a message actually arrives.
+
+## Default — always listen (every active session)
+
+When `always_listen` is on (the default; the SessionStart hook reminds you), keep a
+listener running for the whole session:
+
+1. Launch it as a **background task** (Bash tool, `run_in_background: true`):
+   ```bash
+   ~/.claude/skills/telegram/tg.sh listen
+   ```
+   It blocks cheaply (a flock-coordinated poll loop — only one session calls Telegram
+   at a time) until a message routed to THIS session arrives, then prints it and exits.
+2. When the task completes, the harness re-invokes you with its output: that text is
+   the user's Telegram message. Treat it as a normal user turn — act on it and send
+   your reply with (single quotes — never backticks, see below):
+   ```bash
+   ~/.claude/skills/telegram/tg.sh send 'your reply'
+   ```
+3. **Immediately relaunch** the listener (step 1) so you keep listening. If the task
+   exited with no output (idle timeout), just relaunch.
+
+The terminal stays fully usable the whole time. The user can talk to whichever
+session they want by **replying (Telegram reply-to) to that session's message**;
+non-reply messages go to whichever session grabs them first. Only messages from the
+configured user_id are accepted. Stop only if the user says to stop listening (then
+don't relaunch) — typing in the terminal does NOT stop listening.
 
 ## Mode 1 — notify when done
 
@@ -37,74 +61,38 @@ send a concise summary at the end.
 Long text auto-splits (>4096). For big outputs prefer `file`. Messages are prefixed
 with a project label so the user can tell which session is talking.
 
-**Sending text safely:** if the message may contain backticks or `$(...)` (e.g. code
+**Sending text safely:** if the message may contain backticks or `$(...)` (code
 snippets, commands), do NOT pass it in double quotes — the shell will execute the
 backticks/substitution. Use single quotes, or pipe via stdin:
 `printf '%s' "$msg" | ~/.claude/skills/telegram/tg.sh send -`.
 
-## Mode 2 — two-way chat over Telegram (non-blocking, cron-driven)
+## Auto-mirror after ~10 min idle (proactive heads-up)
 
-When the user says "обсудим в тг" / "let's continue on telegram" / "I'm stepping
-away", DO THIS (it never blocks the terminal):
+Separately from listening, the Stop hook arms a cheap detached watcher: if you finish
+a turn and the user does NOT touch the terminal for `idle_mirror_secs` (default 600s),
+your last message is mirrored to Telegram once. Cancelled the instant the user types
+in the terminal. This pushes "here's what I last said" so the user sees it without
+asking; they can then reply and the always-on listener continues the chat.
 
-1. Mark this session as in Telegram mode (gates hooks):
-   ```bash
-   ~/.claude/skills/telegram/tg.sh away on
-   ```
-2. Send your opening message / question with `tg.sh send`.
-3. Start a **non-blocking poll loop** with `CronCreate` (session-only, recurring,
-   every ~2 min). Use this exact prompt so each fire re-enters the loop, and
-   **remember the returned job id**:
-   > `[tg-poll] Run ~/.claude/skills/telegram/tg.sh recv 3. If it prints text, that is the user's Telegram reply — act on it and send your response with tg.sh send, then stay in Telegram mode. If the text is a return phrase (вернул / в терминал / I'm back / /stop), run CronDelete on this job and tg.sh away off and tell the user you're back. If it prints nothing, end the turn silently. Do not narrate empty polls.`
+## First-time setup / install
 
-Then on every cron fire you'll check Telegram, reply over Telegram, and continue —
-all while the terminal stays free. Reply latency is ~the cron interval (1–2 min);
-each fire costs one model turn. Tune the interval for less cost (slower) or lower
-latency (faster, min 1 min: `*/1 * * * *`).
-
-**End the loop** (CronDelete the job + `tg.sh away off`) when:
-- the user sends a return phrase over Telegram (вернулась / в терминале / I'm back / /stop), or
-- the user types ANYTHING in the terminal (they're back — do this on that turn).
-
-While in Telegram mode, keep messages chat-sized; the user is on their phone.
-
-### Quick one-off question (single turn, may briefly wait)
-
-For a single question where a short inline wait is fine:
 ```bash
-~/.claude/skills/telegram/tg.sh ask "Approach A or B?"   # prints the reply (loops recv, ~120s)
+git clone git@github.com:azalio/claude-telegram-skill.git ~/.claude/skills/telegram \
+  && ~/.claude/skills/telegram/install.sh
+# then: put @BotFather token in config.json, message the bot once, run setup:
+~/.claude/skills/telegram/tg.sh setup        # detects chat_id + user_id
 ```
 
-### Replying / routing (multiple sessions)
+`install.sh` wires the Stop / UserPromptSubmit / Notification / SessionStart hooks
+into `~/.claude/settings.json` idempotently. Claude Code auto-discovers the skill.
 
-Several sessions can use one bot. The user routes a reply to a specific session by
-**replying (Telegram reply-to) to that session's message**. Non-reply messages are
-broadcast and claimed by whichever session polls first. Only messages from the
-configured user_id are accepted.
+## Config (config.json)
 
-## Default — auto-mirror after ~10 min idle (one-way)
-
-Even without Mode 2, the Stop hook arms a cheap detached watcher: if you finish a
-turn and the user does NOT interact in the terminal for `idle_mirror_secs` (default
-600s = 10 min), the watcher mirrors your last message to Telegram once. Cancelled
-the instant the user types in the terminal. This is a one-way heads-up; to actually
-converse, switch to Mode 2 (start the cron poll loop).
-
-## Mode 3 — back at the terminal
-
-The user is back when they type in the **terminal** (UserPromptSubmit hook clears
-this session's marker and cancels the idle watcher) or say a return phrase in
-**Telegram**. On that turn: CronDelete any running tg-poll job and run
-`tg.sh away off`. Then continue normally; don't restart Mode 2 unless asked.
-
-## First-time setup (only if config is missing/unconfigured)
-
-1. Create a bot via [@BotFather](https://t.me/BotFather), get the token.
-2. Put it in `config.json` (copy `config.example.json`), `chmod 600`.
-3. Send any message (e.g. `/start`) to the bot.
-4. `~/.claude/skills/telegram/tg.sh setup` — auto-detects & saves chat_id + user_id.
-
-Check before doing this: `test -f config.json` and the token isn't the placeholder.
+| Key | Meaning |
+|---|---|
+| `token`, `chat_id`, `user_id` | Bot token; your chat; the only sender accepted |
+| `always_listen` | `true` = every session auto-starts the background listener |
+| `idle_mirror_secs` | Seconds of terminal idle before auto-mirroring (0 disables) |
 
 ## Command reference (tg.sh)
 
@@ -112,10 +100,11 @@ Check before doing this: `test -f config.json` and the token isn't the placehold
 |---|---|
 | `send "text"` / `send -` | Send text (or stdin); auto-split; records message_id for reply-routing |
 | `file <path> [cap]` / `photo <path> [cap]` | Send a document / image |
-| `recv [timeout]` | One receive cycle: lock → pump Telegram → claim this session's messages; exit 3 if none |
+| `listen [maxsecs]` | Block (cheap) until a message for this session, print it, exit. Run in background. |
+| `recv [timeout]` | One receive cycle: lock → pump → claim this session's messages; exit 3 if none |
 | `ask "text" [budget]` | Send + wait for the reply inline (loops recv; default 120s) |
-| `away on\|off\|active <dir>\|clear <dir>\|list` | Per-session Telegram-mode marker (keyed by cwd) |
 | `setup` / `drain` | Detect chat_id+user_id / reset offset+inbox |
+| `away on\|off\|active <dir>` | Optional per-session marker gating the Notification-forward hook |
 
 ## How inbound works (bridge.py)
 
@@ -131,9 +120,8 @@ Each session **claims** only its own (or broadcast `*`) messages. Safety:
 ## Notes / limits
 
 - Token only in `config.json` (chmod 600); never echo it.
-- Two-way costs one model turn per poll interval while waiting (no cheap polling
-  primitive exists). Use a 1–2 min interval and CronDelete promptly when done.
-- Telegram is only checked while a session is polling (Mode 2) or via the 10-min
-  one-way idle-mirror. A reply sent when nobody is polling waits in the inbox.
+- Listening is cheap while idle (background task, no model tokens); you spend a turn
+  only when a message arrives and you respond.
+- Many sessions all listening = many short `getUpdates` calls, serialized by the lock.
 - Runtime state (gitignored): `.state` (offset), `sent.map`, `inbox.jsonl`,
   `away.d/`, `idle.d/`, `.lock`.

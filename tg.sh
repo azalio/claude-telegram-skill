@@ -151,6 +151,21 @@ cmd_recv() {
 # Backward-compatible alias.
 cmd_poll() { cmd_recv "${1:-5}"; }
 
+# Block (cheaply, in a background task) until a message routed to THIS session
+# arrives, then print it and exit 0. Loops recv (flock-coordinated, so sessions
+# share Telegram's single getUpdates fairly) with a small backoff. Exits 3 after
+# <maxsecs> (default ~6h) so the caller can relaunch. Meant to be run via the Bash
+# tool with run_in_background:true — the harness re-invokes the agent when it exits.
+cmd_listen() {
+  local maxsecs="${1:-21600}"
+  [[ -n "$CHAT_ID" ]] || die "chat_id not set — run: tg.sh setup" 2
+  while (( SECONDS < maxsecs )); do
+    if out="$(cmd_recv 5 2>/dev/null)"; then printf '%s\n' "$out"; return 0; fi
+    sleep "$(( (RANDOM % 4) + 2 ))"
+  done
+  exit 3
+}
+
 # Send a question, then wait (cooperatively) for YOUR reply. Loops recv with a
 # short backoff until a reply arrives or the total timeout (default 120s) passes.
 cmd_ask() {
@@ -189,6 +204,7 @@ case "${1:-}" in
   photo) shift; cmd_photo "${1:-}" "${2:-}" ;;
   ask)   shift; cmd_ask "${1:-}" "${2:-}" ;;
   recv)  shift; cmd_recv "${1:-}" ;;
+  listen) shift; cmd_listen "${1:-}" ;;
   poll)  shift; cmd_poll "${1:-}" ;;
   drain) cmd_drain ;;
   away)  shift; cmd_away "${1:-}" "${2:-}" ;;

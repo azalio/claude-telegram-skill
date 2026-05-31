@@ -35,7 +35,8 @@ tmp="$(mktemp)"
 jq \
   --arg stop   "$DIR/hook-stop.sh" \
   --arg up     "$DIR/hook-userprompt.sh" \
-  --arg notify "$DIR/hook-notify.sh" '
+  --arg notify "$DIR/hook-notify.sh" \
+  --arg start  "$DIR/hook-sessionstart.sh" '
   def ensure(event; cmd; to):
     .hooks[event] = ((.hooks[event] // [])
       | if any(.[]?.hooks[]?; .command == cmd) then .
@@ -43,6 +44,7 @@ jq \
   ensure("Stop";             $stop;   30)
   | ensure("UserPromptSubmit"; $up;     10)
   | ensure("Notification";     $notify; 15)
+  | ensure("SessionStart";     $start;  10)
 ' "$SETTINGS" > "$tmp"
 jq empty "$tmp" && mv "$tmp" "$SETTINGS" || { echo "✗ settings.json edit failed" >&2; rm -f "$tmp"; exit 1; }
 echo "• hooks wired into $SETTINGS"
