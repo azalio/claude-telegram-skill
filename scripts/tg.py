@@ -35,11 +35,8 @@ INBOX = os.path.join(STATE_DIR, "inbox.jsonl")
 LOCKF = os.path.join(STATE_DIR, "lock")
 AWAYD = os.path.join(STATE_DIR, "away.d")
 IDLED = os.path.join(STATE_DIR, "idle.d")
-BEATD = os.path.join(STATE_DIR, "beat.d")
 INBOX_TTL = 3600     # drop unclaimed messages after 1h
-HEARTBEAT_TTL = 120  # a session counts as "listening" if it touched within this
 SENT_MAX = 500
-AMBIGUOUS = "__ambiguous__"  # held msg that can't be addressed to one session
 SELF = os.path.abspath(__file__)
 RETURN_PHRASES = ("вернул", "в терминал", "i'm back", "im back", "back to terminal", "/stop")
 
@@ -131,31 +128,6 @@ def marker_path(d):
     return os.path.join(AWAYD, "".join(ch if ch.isalnum() else "_" for ch in raw))
 
 
-def beat(key=None):
-    """Mark this session as currently listening. mtime of the marker is the heartbeat."""
-    key = key or session_key()
-    try:
-        os.makedirs(BEATD, exist_ok=True)
-        open(os.path.join(BEATD, key), "w").write(str(int(time.time())))
-    except OSError:
-        pass
-
-
-def live_sessions():
-    """Set of session keys whose heartbeat is fresh (within HEARTBEAT_TTL)."""
-    live = set()
-    if not os.path.isdir(BEATD):
-        return live
-    now = time.time()
-    for fn in os.listdir(BEATD):
-        try:
-            if now - os.path.getmtime(os.path.join(BEATD, fn)) <= HEARTBEAT_TTL:
-                live.add(fn)
-        except OSError:
-            pass
-    return live
-
-
 def reply_target_path(key):
     return os.path.join(STATE_DIR, "reply." + key)
 
@@ -210,15 +182,22 @@ def _send_chunk(text, reply_to=None):
     return (r.get("result") or {}).get("message_id")
 
 
-def record_mids(mids):
+def _append_sent(mids, key):
+    """Append message_id -> session_key rows to sent.map. Assumes the lock is held.
+    Recording EVERY outbound id (replies, nudges, notifications) keeps the map
+    hole-free, so any reply to one of our messages is always attributable."""
     mids = [str(m) for m in mids if m]
     if not mids:
         return
+    lines = open(SENT).read().splitlines() if os.path.exists(SENT) else []
+    lines += ["%s\t%s" % (m, key) for m in mids]
+    with open(SENT, "w") as f:
+        f.write("\n".join(lines[-SENT_MAX:]) + "\n"); f.flush(); os.fsync(f.fileno())
+
+
+def record_mids(mids):
     with Lock():
-        lines = open(SENT).read().splitlines() if os.path.exists(SENT) else []
-        lines += ["%s\t%s" % (m, session_key()) for m in mids]
-        with open(SENT, "w") as f:
-            f.write("\n".join(lines[-SENT_MAX:]) + "\n"); f.flush(); os.fsync(f.fileno())
+        _append_sent(mids, session_key())
 
 
 def cmd_send(arg):
@@ -316,38 +295,32 @@ def _pump(timeout):
         text = msg.get("text")
         if not text:
             continue
+        # Reply-id is the ONLY routing signal. A message is delivered iff it is a
+        # reply to one of our sent messages that we can attribute to a session (via
+        # sent.map). No reply, or a reply we can't attribute -> drop it (with a
+        # one-line nudge) rather than guess which session it belongs to.
         rt = msg.get("reply_to_message")
-        live = live_sessions()
-        nudge = False
-        if rt:
-            # Explicit reply: route to the owning session. If the replied-to message
-            # rotated out of sent.map we can't tell which session it was — hold it
-            # as ambiguous rather than guess (never deliver to the wrong session).
-            owner = sm.get(str(rt.get("message_id")))
-            if owner:
-                to = owner
-            else:
-                to, nudge = AMBIGUOUS, len(live) >= 2
-        elif len(live) == 1:
-            # Exactly one session is listening — a plain message is unambiguous.
-            to = next(iter(live))
-        else:
-            # Zero or several listening — a plain message can't be addressed to one.
-            # Hold it; if several are live, nudge the user to reply to a session.
-            to, nudge = AMBIGUOUS, len(live) >= 2
-        if nudge:
+        owner = sm.get(str(rt.get("message_id"))) if rt else None
+        if not owner:
             try:
-                _send_chunk("🤔 Несколько сессий слушают — непонятно, кому это. "
-                            "Ответь реплаем на сообщение нужной сессии.",
-                            reply_to=msg.get("message_id"))
+                nudge_mid = _send_chunk(
+                    "🤔 Не понял, какой сессии это адресовано. "
+                    "Ответь реплаем на сообщение нужной сессии.",
+                    reply_to=msg.get("message_id"))
+                # Record the nudge under a non-session sentinel so sent.map stays
+                # hole-free, yet a reply to the nudge itself resolves to no session
+                # and is dropped again (rather than silently misrouted).
+                if nudge_mid:
+                    _append_sent([nudge_mid], "__nudge__")
             except Exception:
                 pass
-        items.append({"to": to, "text": text, "ts": now, "uid": uid_,
+            seen.add(uid_)
+            continue  # dropped: never enters the inbox
+        items.append({"to": owner, "text": text, "ts": now, "uid": uid_,
                       "mid": msg.get("message_id")})
         seen.add(uid_)
-    # No broadcast: a message is only ever delivered to its addressed session (or
-    # claimed from the ambiguous hold by a sole live session). An unclaimed message
-    # simply expires — it is never reassigned to a different session.
+    # A message is only ever delivered to the session it is addressed to. Unclaimed
+    # messages expire at INBOX_TTL; they are never reassigned to a different session.
     kept = [it for it in items if now - it.get("ts", now) <= INBOX_TTL]
     write_inbox(kept)          # durable inbox FIRST ...
     set_offset(last + 1)       # ... then advance the Telegram offset
@@ -355,17 +328,8 @@ def _pump(timeout):
 
 def _claim(key):
     items = read_inbox()
-    # A session claims messages addressed to it. An ambiguous hold (no session could
-    # be determined) is claimable only when this is the sole live session, so the
-    # message isn't lost — but a message addressed to another session is never taken.
-    sole = live_sessions() == {key}
-
-    def mine_pred(it):
-        t = it.get("to")
-        return t == key or (sole and t == AMBIGUOUS)
-
-    mine = [it for it in items if mine_pred(it)]
-    rest = [it for it in items if not mine_pred(it)]
+    mine = [it for it in items if it.get("to") == key]
+    rest = [it for it in items if it.get("to") != key]
     if not mine:
         return None
     write_inbox(rest)
@@ -379,7 +343,6 @@ def cmd_recv(timeout):
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
     with Lock():
-        beat()
         _pump(timeout)
         out = _claim(session_key())
     if out is None:
@@ -390,16 +353,39 @@ def cmd_recv(timeout):
 def cmd_listen(maxsecs):
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
+    key = session_key()
+    # Singleton per session: hold an exclusive non-blocking lock for this session
+    # key. If another listener for the same session is already running, exit at once
+    # so listeners can't pile up (the lock auto-releases when this process exits).
+    ensure_dir()
+    singleton = open(os.path.join(STATE_DIR, "listen." + key + ".lock"), "w")
+    try:
+        fcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(3)  # a listener for this session is already running
     start = time.time()
     while time.time() - start < maxsecs:
+        # Hold the shared lock only for an instant: _pump(0) returns immediately
+        # instead of long-polling for 5s under the lock, so many sessions don't
+        # serialize behind a slow poll. Pacing comes from the sleep below.
         with Lock():
-            beat()
-            _pump(5)
-            out = _claim(session_key())
+            _pump(0)
+            out = _claim(key)
         if out is not None:
-            print(out)
+            # Wrap the message so the agent can't miss that a Telegram reply is
+            # REQUIRED before doing anything else — enforces "came from Telegram ->
+            # answer in Telegram first" at the point the message is delivered.
+            tg = os.path.join(STATE_DIR, "tg")
+            cwd = os.environ.get("TG_CWD", "")
+            send = ("TG_CWD='%s' %s send '...'" % (cwd, tg)) if cwd else ("%s send '...'" % tg)
+            print("=== TELEGRAM MESSAGE — reply REQUIRED before acting ===\n"
+                  + out +
+                  "\n=== END. Your FIRST action MUST be to acknowledge in Telegram:\n"
+                  "    %s\n"
+                  "Only AFTER sending that, act on the message, then relaunch the "
+                  "listener. ===" % send)
             return
-        time.sleep(2 + (int(time.time()) % 4))
+        time.sleep(1 + (int(time.time()) % 3))
     sys.exit(3)
 
 
@@ -410,7 +396,6 @@ def cmd_ask(text, budget):
     start = time.time()
     while time.time() - start < budget:
         with Lock():
-            beat()
             _pump(5)
             out = _claim(session_key())
         if out is not None:
@@ -581,8 +566,11 @@ def hook_sessionstart(inp):
         "1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
         "     %s%s listen\n"
         "2. When that task completes it printed a Telegram message routed to this session. "
-        "Read its output, act on it, and reply with:\n"
+        "Read its output. Your FIRST action MUST be to reply in Telegram to acknowledge "
+        "you received it (this is REQUIRED — do not act, plan, or answer only in the "
+        "terminal first):\n"
         "     %s%s send 'your reply'   (single quotes — avoid backticks)\n"
+        "Then act on the message; if it takes a while, send progress/results to Telegram too.\n"
         "3. Then IMMEDIATELY relaunch the listener (step 1). If it exited with no output, just relaunch.\n"
         "Cheap: the background task uses no model tokens while waiting; you wake only on a message. "
         "The user targets a session by replying (Telegram reply-to) to its message. Stop only if asked "
