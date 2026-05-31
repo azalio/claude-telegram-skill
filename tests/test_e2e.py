@@ -59,10 +59,13 @@ def upd(update_id, text, from_id=222, chat_id=111, reply_to=None):
 
 class StructureTests(unittest.TestCase):
     def test_plugin_json(self):
-        p = json.load(open(PLUGIN_JSON))
+        with open(PLUGIN_JSON) as f:
+            p = json.load(f)
         self.assertEqual(p["name"], "telegram-bridge")
-        for k in ("description", "version", "hooks"):
+        for k in ("description", "version"):
             self.assertIn(k, p)
+        # hooks/hooks.json is auto-loaded by convention — must NOT also be declared
+        self.assertNotIn("hooks", p)
 
     def test_marketplace_json(self):
         m = json.load(open(MARKET_JSON))
