@@ -165,6 +165,17 @@ class RoutingTests(unittest.TestCase):
         params = self.api.sent[-1][1]
         self.assertNotIn("reply_to_message_id", params)
 
+    def test_label_is_bold_header_on_own_line(self):
+        os.environ.pop("TG_LABEL", None)
+        os.environ["TG_CWD"] = "/Users/x/gitroot/demoproj"
+        try:
+            self.tg.cmd_send("hello body")
+        finally:
+            os.environ.pop("TG_CWD", None)
+        text = self.api.sent[-1][1]["text"]
+        self.assertTrue(text.startswith("*demoproj*\n"))
+        self.assertEqual(text, "*demoproj*\nhello body")
+
     def test_two_live_sessions_hold_plain(self):
         # 2+ sessions listening -> a plain (no-reply) message is held, not delivered,
         # and the user gets a disambiguation nudge.

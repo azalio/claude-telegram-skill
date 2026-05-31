@@ -119,10 +119,12 @@ def session_key():
 
 
 def label_prefix():
+    """Session name as a bold header on its own line above the message body."""
     lab = os.environ.get("TG_LABEL", "")
     if not lab and os.environ.get("TG_CWD"):
-        lab = "[%s]" % os.path.basename(os.environ["TG_CWD"])
-    return (lab + " ") if lab else ""
+        lab = os.path.basename(os.environ["TG_CWD"])
+    lab = lab.strip("[] ")  # tolerate a previously-bracketed TG_LABEL
+    return ("*%s*\n" % lab) if lab else ""
 
 
 def marker_path(d):
