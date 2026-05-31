@@ -1,0 +1,6 @@
+{
+  "token": "PUT_YOUR_BOT_TOKEN_HERE",
+  "chat_id": null,
+  "user_id": null,
+  "idle_mirror_secs": 600
+}
