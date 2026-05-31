@@ -372,7 +372,18 @@ def cmd_listen(maxsecs):
             _pump(0)
             out = _claim(key)
         if out is not None:
-            print(out)
+            # Wrap the message so the agent can't miss that a Telegram reply is
+            # REQUIRED before doing anything else — enforces "came from Telegram ->
+            # answer in Telegram first" at the point the message is delivered.
+            tg = os.path.join(STATE_DIR, "tg")
+            cwd = os.environ.get("TG_CWD", "")
+            send = ("TG_CWD='%s' %s send '...'" % (cwd, tg)) if cwd else ("%s send '...'" % tg)
+            print("=== TELEGRAM MESSAGE — reply REQUIRED before acting ===\n"
+                  + out +
+                  "\n=== END. Your FIRST action MUST be to acknowledge in Telegram:\n"
+                  "    %s\n"
+                  "Only AFTER sending that, act on the message, then relaunch the "
+                  "listener. ===" % send)
             return
         time.sleep(1 + (int(time.time()) % 3))
     sys.exit(3)
@@ -555,8 +566,11 @@ def hook_sessionstart(inp):
         "1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
         "     %s%s listen\n"
         "2. When that task completes it printed a Telegram message routed to this session. "
-        "Read its output, act on it, and reply with:\n"
+        "Read its output. Your FIRST action MUST be to reply in Telegram to acknowledge "
+        "you received it (this is REQUIRED — do not act, plan, or answer only in the "
+        "terminal first):\n"
         "     %s%s send 'your reply'   (single quotes — avoid backticks)\n"
+        "Then act on the message; if it takes a while, send progress/results to Telegram too.\n"
         "3. Then IMMEDIATELY relaunch the listener (step 1). If it exited with no output, just relaunch.\n"
         "Cheap: the background task uses no model tokens while waiting; you wake only on a message. "
         "The user targets a session by replying (Telegram reply-to) to its message. Stop only if asked "
