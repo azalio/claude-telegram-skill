@@ -23,6 +23,40 @@ Then configure the bot (state lives in `~/.claude/telegram/`, never inside the p
 
 The SessionStart hook writes the `~/.claude/telegram/tg` launcher on first run.
 
+## Getting the config values
+
+`~/.claude/telegram/config.json` has five fields. Here is how to obtain each:
+
+| Field | What it is | How to get it |
+| --- | --- | --- |
+| `token` | Bot API token | In Telegram, message [@BotFather](https://t.me/BotFather) → `/newbot` → pick a name and username → it replies with a token like `123456789:AA...`. Re-issue anytime with `/token`. |
+| `chat_id` | Where messages are sent | Auto-filled by `tg setup` (see below). It is the chat between you and your bot. |
+| `user_id` | Allow-listed sender | Auto-filled by `tg setup`. Only messages **from this user id** are accepted, so a stranger who finds your bot can't drive your sessions. For a 1:1 bot it equals your own Telegram user id. |
+| `idle_mirror_secs` | Auto-mirror delay | Seconds with no terminal reply before the last message is pushed to Telegram once. Default `600` (10 min); set `0` to disable. |
+| `always_listen` | Always-on listener | `true` makes every session keep a background listener so you can chat at any time. `false` = notify-only. |
+
+### Step by step
+
+1. **Create the bot and copy the token.** Open [@BotFather](https://t.me/BotFather), send `/newbot`, follow the prompts, copy the token it gives you.
+2. **Write the token into the config.**
+   ```bash
+   mkdir -p ~/.claude/telegram
+   cp config.example.json ~/.claude/telegram/config.json   # from this repo
+   # then edit ~/.claude/telegram/config.json and paste your token into "token"
+   ```
+3. **Say hi to your bot.** Open the chat with your new bot in Telegram and send it any message (e.g. `/start`). This is required — Telegram only reveals your `chat_id`/`user_id` after you message the bot first.
+4. **Auto-detect `chat_id` and `user_id`.**
+   ```bash
+   ~/.claude/telegram/tg setup
+   # -> chat_id set to <n>, user_id <n>
+   ```
+   `setup` reads the bot's pending updates, takes the chat and sender of your latest message, and writes both ids into the config.
+
+> Prefer to fill the ids by hand? Send your bot a message, then open
+> `https://api.telegram.org/bot<token>/getUpdates` in a browser — `result[].message.chat.id`
+> is your `chat_id` and `result[].message.from.id` is your `user_id`. `tg setup` just
+> automates this.
+
 ## What it does
 
 - **Notify on done** — "ping me on telegram when you finish" → a summary; also `file`/`photo`.
