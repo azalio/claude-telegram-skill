@@ -37,6 +37,11 @@ send a concise summary at the end.
 Long text auto-splits (>4096). For big outputs prefer `file`. Messages are prefixed
 with a project label so the user can tell which session is talking.
 
+**Sending text safely:** if the message may contain backticks or `$(...)` (e.g. code
+snippets, commands), do NOT pass it in double quotes — the shell will execute the
+backticks/substitution. Use single quotes, or pipe via stdin:
+`printf '%s' "$msg" | ~/.claude/skills/telegram/tg.sh send -`.
+
 ## Mode 2 — two-way chat over Telegram (non-blocking, cron-driven)
 
 When the user says "обсудим в тг" / "let's continue on telegram" / "I'm stepping
