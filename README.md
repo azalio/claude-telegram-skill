@@ -68,15 +68,21 @@ The SessionStart hook writes the `~/.claude/telegram/tg` launcher on first run.
 - **Multi-session routing** — address a specific session by *replying* (Telegram
   reply-to) to its message. Inbound is serialized with `flock`, written before the
   Telegram offset advances (crash-safe), de-duplicated by `update_id`, and accepts
-  messages only from your `user_id`.
+  messages only from your `user_id`. There is **no broadcast** — a message is only
+  ever delivered to the session it is addressed to, so it can't be stolen by another
+  session (e.g. one that happens to poll first while the intended one is busy).
 
 ## How it works
 
 `getUpdates` is single-consumer with one destructive offset, so the lock holder
-**pumps** all updates into a shared inbox tagging each with its target session
-(via `reply_to` → sent-message map); each session **claims** only its own (or
-broadcast `*`) messages. A reply unclaimed for >10 min is downgraded to broadcast
-(dead-session fallback) and dropped after 1 h.
+**pumps** all updates into a shared inbox, tagging each with its target session
+(via `reply_to` → sent-message map); each session **claims** only its own. A reply
+to a known session always goes to that session and waits (up to 1 h) until it next
+listens — it is never reassigned. A plain (non-reply) message goes to the single
+listening session if there is exactly one; otherwise it is held as *ambiguous* (a
+reply-to-disambiguate nudge is sent when several sessions are live) and may be
+claimed by whichever session is the sole live listener. Unclaimed messages expire
+after 1 h.
 
 ## Layout
 

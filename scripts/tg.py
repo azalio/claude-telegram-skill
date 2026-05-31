@@ -37,10 +37,9 @@ AWAYD = os.path.join(STATE_DIR, "away.d")
 IDLED = os.path.join(STATE_DIR, "idle.d")
 BEATD = os.path.join(STATE_DIR, "beat.d")
 INBOX_TTL = 3600     # drop unclaimed messages after 1h
-ROUTED_TTL = 600     # after 10min, a message to a dead session -> broadcast
 HEARTBEAT_TTL = 120  # a session counts as "listening" if it touched within this
 SENT_MAX = 500
-AMBIGUOUS = "__ambiguous__"  # held non-reply msg while 2+ sessions listen
+AMBIGUOUS = "__ambiguous__"  # held msg that can't be addressed to one session
 SELF = os.path.abspath(__file__)
 RETURN_PHRASES = ("вернул", "в терминал", "i'm back", "im back", "back to terminal", "/stop")
 
@@ -229,7 +228,6 @@ def cmd_send(arg):
     if not text:
         die('usage: tg.py send "text"   (or: ... | tg.py send -)')
     text = label_prefix() + text
-    beat()  # an actively-sending session counts as live for strict-reply routing
     rt = get_reply_target(session_key())  # thread onto the user's last message to us
     mids = []
     for i in range(0, len(text), 4000):
@@ -319,44 +317,55 @@ def _pump(timeout):
         if not text:
             continue
         rt = msg.get("reply_to_message")
+        live = live_sessions()
+        nudge = False
         if rt:
-            # Explicit reply: route to the owning session (or broadcast if unknown).
-            to = sm.get(str(rt.get("message_id")), "*")
-        elif len(live_sessions()) >= 2:
-            # Strict-reply: with multiple sessions listening, a plain (un-replied)
-            # message is ambiguous — hold it (don't deliver to a random session) and
-            # nudge the user to reply to a specific session's message.
-            to = AMBIGUOUS
+            # Explicit reply: route to the owning session. If the replied-to message
+            # rotated out of sent.map we can't tell which session it was — hold it
+            # as ambiguous rather than guess (never deliver to the wrong session).
+            owner = sm.get(str(rt.get("message_id")))
+            if owner:
+                to = owner
+            else:
+                to, nudge = AMBIGUOUS, len(live) >= 2
+        elif len(live) == 1:
+            # Exactly one session is listening — a plain message is unambiguous.
+            to = next(iter(live))
+        else:
+            # Zero or several listening — a plain message can't be addressed to one.
+            # Hold it; if several are live, nudge the user to reply to a session.
+            to, nudge = AMBIGUOUS, len(live) >= 2
+        if nudge:
             try:
                 _send_chunk("🤔 Несколько сессий слушают — непонятно, кому это. "
                             "Ответь реплаем на сообщение нужной сессии.",
                             reply_to=msg.get("message_id"))
             except Exception:
                 pass
-        else:
-            to = "*"
         items.append({"to": to, "text": text, "ts": now, "uid": uid_,
                       "mid": msg.get("message_id")})
         seen.add(uid_)
-    kept = []
-    for it in items:
-        age = now - it.get("ts", now)
-        if age > INBOX_TTL:
-            continue
-        # A reply to a session that never claimed downgrades to broadcast so a live
-        # session can pick it up. Ambiguous holds are intentionally NOT downgraded —
-        # the user must reply to disambiguate.
-        if age > ROUTED_TTL and it.get("to") != AMBIGUOUS:
-            it["to"] = "*"
-        kept.append(it)
+    # No broadcast: a message is only ever delivered to its addressed session (or
+    # claimed from the ambiguous hold by a sole live session). An unclaimed message
+    # simply expires — it is never reassigned to a different session.
+    kept = [it for it in items if now - it.get("ts", now) <= INBOX_TTL]
     write_inbox(kept)          # durable inbox FIRST ...
     set_offset(last + 1)       # ... then advance the Telegram offset
 
 
 def _claim(key):
     items = read_inbox()
-    mine = [it for it in items if it.get("to") in (key, "*")]
-    rest = [it for it in items if it.get("to") not in (key, "*")]
+    # A session claims messages addressed to it. An ambiguous hold (no session could
+    # be determined) is claimable only when this is the sole live session, so the
+    # message isn't lost — but a message addressed to another session is never taken.
+    sole = live_sessions() == {key}
+
+    def mine_pred(it):
+        t = it.get("to")
+        return t == key or (sole and t == AMBIGUOUS)
+
+    mine = [it for it in items if mine_pred(it)]
+    rest = [it for it in items if not mine_pred(it)]
     if not mine:
         return None
     write_inbox(rest)

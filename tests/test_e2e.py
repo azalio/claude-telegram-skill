@@ -113,6 +113,7 @@ class RoutingTests(unittest.TestCase):
         os.environ["TG_KEY"] = key
         os.environ.pop("TG_CWD", None)
         with self.tg.Lock():
+            self.tg.beat(key)  # a receiving session is a live listener
             self.tg._pump(0)
             return self.tg._claim(key)
 
@@ -143,9 +144,10 @@ class RoutingTests(unittest.TestCase):
         items = self.tg.read_inbox()
         self.assertEqual(len([i for i in items if i["uid"] == 3]), 1)
 
-    def test_broadcast_claimable_by_any(self):
-        self.api.updates = [upd(4, "to anyone")]
-        self.assertEqual(self._recv_as("whoever"), "to anyone")
+    def test_plain_delivered_to_sole_live_session(self):
+        # no broadcast: a plain message goes to the one session that is listening
+        self.api.updates = [upd(4, "to the only listener")]
+        self.assertEqual(self._recv_as("whoever"), "to the only listener")
 
     def test_send_threads_onto_last_inbound(self):
         # after a session claims a message, its next send() replies onto that message
@@ -189,22 +191,26 @@ class RoutingTests(unittest.TestCase):
         hint = [s for s in self.api.sent if "реплаем" in (s[1] or {}).get("text", "")]
         self.assertEqual(len(hint), 1)  # nudge sent exactly once
 
-    def test_one_live_session_plain_broadcasts(self):
-        # only one session listening -> plain message still broadcasts (no regression).
-        self.tg.beat("solo")
+    def test_one_live_session_plain_delivered(self):
+        # only one session listening -> plain message is delivered to it (no broadcast).
         self.api.updates = [upd(11, "plain to solo")]
         self.assertEqual(self._recv_as("solo"), "plain to solo")
 
-    def test_ambiguous_not_downgraded_to_broadcast(self):
-        # a held ambiguous message must NOT become broadcast after ROUTED_TTL.
-        old_ts = int(time.time()) - (self.tg.ROUTED_TTL + 60)
+    def test_ambiguous_claimed_by_sole_live_session(self):
+        # a held ambiguous message is delivered to the sole live session (not lost).
         self.tg.write_inbox([{"to": self.tg.AMBIGUOUS, "text": "held",
-                              "ts": old_ts, "uid": 12}])
-        with self.tg.Lock():
-            self.tg._pump(0)
-        items = self.tg.read_inbox()
-        self.assertEqual(items[0]["to"], self.tg.AMBIGUOUS)
-        self.assertIsNone(self._recv_as("anySession"))
+                              "ts": int(time.time()), "uid": 12}])
+        self.assertEqual(self._recv_as("only"), "held")
+
+    def test_ambiguous_held_when_multiple_live(self):
+        # with 2+ live sessions, an ambiguous message is NOT claimed by anyone.
+        self.tg.beat("sessA")
+        self.tg.beat("sessB")
+        self.tg.write_inbox([{"to": self.tg.AMBIGUOUS, "text": "held",
+                              "ts": int(time.time()), "uid": 12}])
+        self.assertIsNone(self._recv_as("sessA"))
+        self.assertIsNone(self._recv_as("sessB"))
+        self.assertEqual(self.tg.read_inbox()[0]["to"], self.tg.AMBIGUOUS)
 
     def test_reply_still_routes_with_two_live(self):
         # explicit reply must keep working even when multiple sessions are live.
@@ -215,17 +221,27 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(self._recv_as("sessB"))
         self.assertEqual(self._recv_as("sessA"), "answer A")
 
-    def test_dead_session_downgrade(self):
-        # message routed to a session that never claims; after ROUTED_TTL (but before
-        # INBOX_TTL) it is downgraded to broadcast so a live session can pick it up
-        old_ts = int(time.time()) - (self.tg.ROUTED_TTL + 60)
-        self.tg.write_inbox([{"to": "sessGhost", "text": "orphan",
-                              "ts": old_ts, "uid": 7}])
-        with self.tg.Lock():
-            self.tg._pump(0)  # prune/downgrade runs inside pump
+    def test_addressed_message_never_stolen(self):
+        # the original bug: a message addressed to a busy session (not currently
+        # listening) must NOT be handed to a different live session. It waits.
+        self.tg.write_inbox([{"to": "busySession", "text": "for busy only",
+                              "ts": int(time.time()), "uid": 7, "mid": 500}])
+        # a different, live session pumps + claims: it must not get the message
+        self.assertIsNone(self._recv_as("otherSession"))
+        # and the message is still there, still addressed to the busy session
         items = self.tg.read_inbox()
-        self.assertEqual(items[0]["to"], "*")
-        self.assertEqual(self._recv_as("freshSession"), "orphan")
+        self.assertEqual(items[0]["to"], "busySession")
+        # when the intended session finally listens, it claims its own message
+        self.assertEqual(self._recv_as("busySession"), "for busy only")
+
+    def test_expired_message_dropped_not_reassigned(self):
+        # an unclaimed addressed message expires at INBOX_TTL; it is never broadcast.
+        old_ts = int(time.time()) - (self.tg.INBOX_TTL + 60)
+        self.tg.write_inbox([{"to": "ghost", "text": "stale",
+                              "ts": old_ts, "uid": 9, "mid": 600}])
+        with self.tg.Lock():
+            self.tg._pump(0)  # prune runs inside pump
+        self.assertEqual(self.tg.read_inbox(), [])
 
 
 if __name__ == "__main__":
