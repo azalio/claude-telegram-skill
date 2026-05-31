@@ -1,60 +1,73 @@
-# Telegram bridge — a Claude Code skill
+# telegram-bridge — a Claude Code plugin
 
-Lets Claude Code message you on Telegram when work finishes, and have a **two-way
-chat** with you while you're away from the terminal — with **no daemon and no
-blocking hook**. Works across multiple concurrent Claude sessions sharing one bot.
+Message Claude on Telegram when work finishes, and **chat with it two-way while away
+from the terminal** — non-blocking, with **every active session always listening**.
+Multiple concurrent sessions share one bot, coordinated by a file lock so only one
+polls Telegram at a time. No daemon, no server — just a bot token.
+
+## Install
+
+```text
+/plugin marketplace add azalio/claude-telegram-skill
+/plugin install telegram-bridge@azalio
+```
+
+Then configure the bot (state lives in `~/.claude/telegram/`, never inside the plugin):
+
+```bash
+# 1) create a bot with @BotFather, copy the token
+# 2) put it in ~/.claude/telegram/config.json  (copy config.example.json there)
+# 3) send your bot any message (e.g. /start), then:
+~/.claude/telegram/tg setup     # auto-detects chat_id + user_id
+```
+
+The SessionStart hook writes the `~/.claude/telegram/tg` launcher on first run.
 
 ## What it does
 
-- **Notify when done** — `tg.sh send "..."`, plus `file`/`photo` for documents and images.
-- **Two-way chat** — driven by a non-blocking `CronCreate` poll loop; you reply in
-  Telegram and Claude continues. The terminal is never frozen.
-- **Auto-mirror** — after ~10 min of no terminal reply, the assistant's last message
-  is mirrored to Telegram once (a detached, zero-cost heads-up).
-- **Multi-session routing** — several Claude sessions share one bot; you address a
-  specific session by *replying* (Telegram reply-to) to its message. Inbound is
-  serialized with `flock`, written before the Telegram offset advances (crash-safe),
-  de-duplicated by `update_id`, and accepts messages only from your user_id.
+- **Notify on done** — "ping me on telegram when you finish" → a summary; also `file`/`photo`.
+- **Two-way chat, always on** — every session keeps a cheap background listener
+  (`tg listen`); it costs no model tokens while idle and wakes only when a message
+  arrives. Reply in Telegram and Claude continues. The terminal is never blocked.
+- **Auto-mirror** — after ~10 min with no terminal reply, the last message is pushed
+  to Telegram once.
+- **Multi-session routing** — address a specific session by *replying* (Telegram
+  reply-to) to its message. Inbound is serialized with `flock`, written before the
+  Telegram offset advances (crash-safe), de-duplicated by `update_id`, and accepts
+  messages only from your `user_id`.
 
-See [`SKILL.md`](./SKILL.md) for the full behavior and command reference.
+## How it works
 
-## Install (one command)
+`getUpdates` is single-consumer with one destructive offset, so the lock holder
+**pumps** all updates into a shared inbox tagging each with its target session
+(via `reply_to` → sent-message map); each session **claims** only its own (or
+broadcast `*`) messages. A reply unclaimed for >10 min is downgraded to broadcast
+(dead-session fallback) and dropped after 1 h.
 
-```bash
-git clone git@github.com:azalio/claude-telegram-skill.git ~/.claude/skills/telegram \
-  && ~/.claude/skills/telegram/install.sh
+## Layout
+
+```
+.claude-plugin/plugin.json        plugin manifest (hooks → hooks/hooks.json)
+.claude-plugin/marketplace.json   this repo is its own marketplace
+skills/telegram/SKILL.md          the skill Claude reads
+scripts/tg.py                     all logic (stdlib only)
+hooks/hooks.json                  Stop / UserPromptSubmit / Notification / SessionStart
+tests/test_e2e.py                 e2e tests (run in CI, no token)
+config.example.json               copy to ~/.claude/telegram/config.json
 ```
 
-`install.sh` is idempotent: it makes the scripts executable, seeds `config.json`,
-and wires the Stop / UserPromptSubmit / Notification hooks into
-`~/.claude/settings.json` without touching your other hooks. Then:
+## Test
 
 ```bash
-# 1) put your @BotFather token in ~/.claude/skills/telegram/config.json
-# 2) send any message (e.g. /start) to your bot in Telegram
-~/.claude/skills/telegram/tg.sh setup     # auto-detects chat_id + user_id
+python3 tests/test_e2e.py                 # structure + routing on mocks, no token
+claude plugin validate . --strict         # official schema validation
+claude --plugin-dir . -p "..." --bare     # load locally, headless
 ```
 
-Claude Code auto-discovers the skill (no restart needed). Now say e.g. "ping me on
-telegram when done" or "let's discuss on telegram".
-
-Requires `jq`, `curl`, `python3`.
-
-## Files
-
-| File | Role |
-|---|---|
-| `SKILL.md` | Skill definition + usage the agent reads |
-| `tg.sh` | Outbound + CLI: `send`/`file`/`photo`/`ask`/`recv`/`away`/`setup` |
-| `bridge.py` | Inbound routing/locking: pump → inbox → claim (flock, dedup, fsync-before-offset) |
-| `hook-stop.sh` | Non-blocking Stop hook: arms the idle auto-mirror |
-| `hook-notify.sh` | Forwards "needs permission"/idle notifications while in Telegram mode |
-| `hook-userprompt.sh` | Terminal input = you're back: cancels watcher, clears mode |
-| `idle-mirror.sh` | Detached 10-min idle auto-mirror watcher |
-| `config.example.json` | Template — copy to `config.json` (gitignored, holds your token) |
+CI (`.github/workflows/e2e`) runs the e2e tests on every push/PR.
 
 ## Security
 
-`config.json` (bot token, chat_id, user_id) and all runtime state
-(`.state`, `sent.map`, `inbox.jsonl`, `away.d/`, `idle.d/`, `.lock`) are gitignored.
-Never commit your token.
+Your bot token, chat_id, user_id and all runtime state live in `~/.claude/telegram/`,
+outside the plugin and out of git. Only messages from your configured `user_id` are
+accepted. Never commit your token.

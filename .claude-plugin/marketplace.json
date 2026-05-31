@@ -1,0 +1,16 @@
+{
+  "name": "azalio",
+  "owner": { "name": "azalio" },
+  "plugins": [
+    {
+      "name": "telegram-bridge",
+      "source": ".",
+      "description": "Two-way Telegram bridge for Claude Code: notify on done + always-listening non-blocking chat, multi-session, no daemon.",
+      "version": "1.0.0",
+      "author": { "name": "azalio" },
+      "homepage": "https://github.com/azalio/claude-telegram-skill",
+      "license": "MIT",
+      "keywords": ["telegram", "notifications", "chat", "two-way"]
+    }
+  ]
+}

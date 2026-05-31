@@ -1,7 +1,3 @@
-config.json
-.state
-.lock
-sent.map
-inbox.jsonl
-away.d/
-idle.d/
+__pycache__/
+*.pyc
+.DS_Store
