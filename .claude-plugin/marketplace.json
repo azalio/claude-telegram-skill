@@ -1,16 +1,28 @@
 {
   "name": "azalio",
-  "owner": { "name": "azalio" },
+  "owner": {
+    "name": "azalio"
+  },
   "plugins": [
     {
       "name": "telegram-bridge",
-      "source": { "source": "github", "repo": "azalio/claude-telegram-skill" },
+      "source": {
+        "source": "github",
+        "repo": "azalio/claude-telegram-skill"
+      },
       "description": "Two-way Telegram bridge for Claude Code: notify on done + always-listening non-blocking chat, multi-session, no daemon.",
-      "version": "1.0.1",
-      "author": { "name": "azalio" },
+      "version": "1.0.2",
+      "author": {
+        "name": "azalio"
+      },
       "homepage": "https://github.com/azalio/claude-telegram-skill",
       "license": "MIT",
-      "keywords": ["telegram", "notifications", "chat", "two-way"]
+      "keywords": [
+        "telegram",
+        "notifications",
+        "chat",
+        "two-way"
+      ]
     }
   ]
 }

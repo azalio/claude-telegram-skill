@@ -25,7 +25,7 @@ Usage:
 Env: TG_CWD / TG_LABEL set the per-session routing key and the outbound label.
 Exit codes: 0 ok, 2 config missing/invalid, 3 timeout/no-message, 1 other.
 """
-import sys, os, json, time, fcntl, subprocess, urllib.parse, urllib.request
+import sys, os, json, time, fcntl, subprocess, io, contextlib, urllib.parse, urllib.request
 
 STATE_DIR = os.environ.get("TG_STATE_DIR") or os.path.expanduser("~/.claude/telegram")
 CONFIG = os.path.join(STATE_DIR, "config.json")
@@ -453,7 +453,7 @@ def ensure_launcher():
     return launcher
 
 
-def hook_sessionstart(*_):
+def hook_sessionstart(inp):
     try:
         c = load_cfg()
     except SystemExit:
@@ -461,6 +461,21 @@ def hook_sessionstart(*_):
     tg = ensure_launcher()
     if not c.get("chat_id") or not c.get("always_listen", False):
         return
+    # Announce this session to Telegram ("I'm session X, now listening"). This
+    # message is also the reply-anchor for addressing this session. Suppress the
+    # command's stdout so it doesn't corrupt the hook's JSON output.
+    cwd = inp.get("cwd", "") or os.getcwd()
+    sid = (inp.get("session_id", "") or "")[:8]
+    label = os.path.basename(cwd) or cwd
+    os.environ["TG_CWD"] = cwd
+    msg = ("🟢 *Сессия на связи*: `%s`\nsid `%s` · `%s`\n"
+           "Слушаю Telegram. _Ответь реплаем на это сообщение, чтобы писать именно этой сессии._"
+           % (label, sid or "?", cwd))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_send(msg)
+    except Exception:
+        pass
     ctx = (
         "Telegram always-listen is ON for this session. Early on your first turn, start "
         "listening and keep it up for the whole session:\n"
