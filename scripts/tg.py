@@ -476,18 +476,22 @@ def hook_sessionstart(inp):
             cmd_send(msg)
     except Exception:
         pass
+    # Pin TG_CWD in the commands so the listener's routing key matches the startup
+    # announcement's key even if you cd elsewhere — replies to this session's
+    # message then reliably come back to THIS session.
+    pre = "TG_CWD='%s' " % cwd
     ctx = (
         "Telegram always-listen is ON for this session. Early on your first turn, start "
         "listening and keep it up for the whole session:\n"
         "1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
-        "     %s listen\n"
+        "     %s%s listen\n"
         "2. When that task completes it printed a Telegram message routed to this session. "
         "Read its output, act on it, and reply with:\n"
-        "     %s send 'your reply'   (single quotes — avoid backticks)\n"
+        "     %s%s send 'your reply'   (single quotes — avoid backticks)\n"
         "3. Then IMMEDIATELY relaunch the listener (step 1). If it exited with no output, just relaunch.\n"
         "Cheap: the background task uses no model tokens while waiting; you wake only on a message. "
         "The user targets a session by replying (Telegram reply-to) to its message. Stop only if asked "
-        "to stop listening. Never block the terminal." % (tg, tg)
+        "to stop listening. Never block the terminal." % (pre, tg, pre, tg)
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
