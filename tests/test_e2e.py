@@ -113,7 +113,6 @@ class RoutingTests(unittest.TestCase):
         os.environ["TG_KEY"] = key
         os.environ.pop("TG_CWD", None)
         with self.tg.Lock():
-            self.tg.beat(key)  # a receiving session is a live listener
             self.tg._pump(0)
             return self.tg._claim(key)
 
@@ -137,17 +136,28 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(self._recv_as("sessA"))
 
     def test_dedup_by_update_id(self):
-        self.api.updates = [upd(3, "broadcast hi")]
+        mid = self._send_as("sessA", "q")  # so the reply is attributable
+        self.api.updates = [upd(3, "addressed hi", reply_to=mid)]
         with self.tg.Lock():
             self.tg._pump(0)
             self.tg._pump(0)  # same update again (e.g. crash replay)
         items = self.tg.read_inbox()
         self.assertEqual(len([i for i in items if i["uid"] == 3]), 1)
 
-    def test_plain_delivered_to_sole_live_session(self):
-        # no broadcast: a plain message goes to the one session that is listening
-        self.api.updates = [upd(4, "to the only listener")]
-        self.assertEqual(self._recv_as("whoever"), "to the only listener")
+    def test_plain_message_without_reply_is_dropped(self):
+        # no guessing: a message with no reply-to is dropped, never delivered.
+        self.api.updates = [upd(4, "no reply, to nobody")]
+        self.assertIsNone(self._recv_as("whoever"))
+        self.assertEqual(self.tg.read_inbox(), [])  # not held anywhere
+        # the user gets a one-line nudge to reply to a session
+        hint = [s for s in self.api.sent if "реплаем" in (s[1] or {}).get("text", "")]
+        self.assertEqual(len(hint), 1)
+
+    def test_reply_to_unknown_message_is_dropped(self):
+        # a reply to a message_id not in sent.map can't be attributed -> dropped.
+        self.api.updates = [upd(5, "reply to a stranger msg", reply_to=999999)]
+        self.assertIsNone(self._recv_as("whoever"))
+        self.assertEqual(self.tg.read_inbox(), [])
 
     def test_send_threads_onto_last_inbound(self):
         # after a session claims a message, its next send() replies onto that message
@@ -178,47 +188,33 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(text.startswith("*demoproj*\n"))
         self.assertEqual(text, "*demoproj*\nhello body")
 
-    def test_two_live_sessions_hold_plain(self):
-        # 2+ sessions listening -> a plain (no-reply) message is held, not delivered,
-        # and the user gets a disambiguation nudge.
-        self.tg.beat("sessA")
-        self.tg.beat("sessB")
-        self.api.updates = [upd(10, "ambiguous plain")]
+    def test_every_outbound_id_recorded_no_holes(self):
+        # the root cause of "Делай фичу 2" going astray: sent.map had holes because
+        # nudges weren't recorded. Now an unattributed message triggers a nudge whose
+        # id IS recorded, so the map has no gaps.
+        self.api.updates = [upd(14, "stray, no reply")]
         with self.tg.Lock():
             self.tg._pump(0)
+        sent_map = open(os.path.join(self.tmp, "sent.map")).read()
+        self.assertIn("%s\t__nudge__" % self.api._mid, sent_map)
+
+    def test_reply_to_nudge_is_not_misrouted(self):
+        # replying to the bot's nudge resolves to no real session -> not delivered.
+        self.api.updates = [upd(15, "stray")]
+        with self.tg.Lock():
+            self.tg._pump(0)
+        nudge_id = self.api._mid
+        self.api.updates = [upd(16, "replying to the nudge", reply_to=nudge_id)]
         self.assertIsNone(self._recv_as("sessA"))
+
+    def test_reply_routes_when_many_sessions_exist(self):
+        # routing is by reply-id alone; the number of other sessions is irrelevant.
+        midA = self._send_as("sessA", "q from A")
+        self._send_as("sessB", "q from B")
+        self._send_as("sessC", "q from C")
+        self.api.updates = [upd(13, "answer A", reply_to=midA)]
         self.assertIsNone(self._recv_as("sessB"))
-        hint = [s for s in self.api.sent if "реплаем" in (s[1] or {}).get("text", "")]
-        self.assertEqual(len(hint), 1)  # nudge sent exactly once
-
-    def test_one_live_session_plain_delivered(self):
-        # only one session listening -> plain message is delivered to it (no broadcast).
-        self.api.updates = [upd(11, "plain to solo")]
-        self.assertEqual(self._recv_as("solo"), "plain to solo")
-
-    def test_ambiguous_claimed_by_sole_live_session(self):
-        # a held ambiguous message is delivered to the sole live session (not lost).
-        self.tg.write_inbox([{"to": self.tg.AMBIGUOUS, "text": "held",
-                              "ts": int(time.time()), "uid": 12}])
-        self.assertEqual(self._recv_as("only"), "held")
-
-    def test_ambiguous_held_when_multiple_live(self):
-        # with 2+ live sessions, an ambiguous message is NOT claimed by anyone.
-        self.tg.beat("sessA")
-        self.tg.beat("sessB")
-        self.tg.write_inbox([{"to": self.tg.AMBIGUOUS, "text": "held",
-                              "ts": int(time.time()), "uid": 12}])
-        self.assertIsNone(self._recv_as("sessA"))
-        self.assertIsNone(self._recv_as("sessB"))
-        self.assertEqual(self.tg.read_inbox()[0]["to"], self.tg.AMBIGUOUS)
-
-    def test_reply_still_routes_with_two_live(self):
-        # explicit reply must keep working even when multiple sessions are live.
-        self.tg.beat("sessA")
-        self.tg.beat("sessB")
-        mid = self._send_as("sessA", "q from A")
-        self.api.updates = [upd(13, "answer A", reply_to=mid)]
-        self.assertIsNone(self._recv_as("sessB"))
+        self.assertIsNone(self._recv_as("sessC"))
         self.assertEqual(self._recv_as("sessA"), "answer A")
 
     def test_addressed_message_never_stolen(self):
