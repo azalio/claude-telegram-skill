@@ -35,9 +35,12 @@ INBOX = os.path.join(STATE_DIR, "inbox.jsonl")
 LOCKF = os.path.join(STATE_DIR, "lock")
 AWAYD = os.path.join(STATE_DIR, "away.d")
 IDLED = os.path.join(STATE_DIR, "idle.d")
+BEATD = os.path.join(STATE_DIR, "beat.d")
 INBOX_TTL = 3600     # drop unclaimed messages after 1h
 ROUTED_TTL = 600     # after 10min, a message to a dead session -> broadcast
+HEARTBEAT_TTL = 120  # a session counts as "listening" if it touched within this
 SENT_MAX = 500
+AMBIGUOUS = "__ambiguous__"  # held non-reply msg while 2+ sessions listen
 SELF = os.path.abspath(__file__)
 RETURN_PHRASES = ("вернул", "в терминал", "i'm back", "im back", "back to terminal", "/stop")
 
@@ -116,15 +119,68 @@ def session_key():
 
 
 def label_prefix():
+    """Session name as a bold header on its own line above the message body."""
     lab = os.environ.get("TG_LABEL", "")
     if not lab and os.environ.get("TG_CWD"):
-        lab = "[%s]" % os.path.basename(os.environ["TG_CWD"])
-    return (lab + " ") if lab else ""
+        lab = os.path.basename(os.environ["TG_CWD"])
+    lab = lab.strip("[] ")  # tolerate a previously-bracketed TG_LABEL
+    return ("*%s*\n" % lab) if lab else ""
 
 
 def marker_path(d):
     raw = d or os.getcwd()
     return os.path.join(AWAYD, "".join(ch if ch.isalnum() else "_" for ch in raw))
+
+
+def beat(key=None):
+    """Mark this session as currently listening. mtime of the marker is the heartbeat."""
+    key = key or session_key()
+    try:
+        os.makedirs(BEATD, exist_ok=True)
+        open(os.path.join(BEATD, key), "w").write(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def live_sessions():
+    """Set of session keys whose heartbeat is fresh (within HEARTBEAT_TTL)."""
+    live = set()
+    if not os.path.isdir(BEATD):
+        return live
+    now = time.time()
+    for fn in os.listdir(BEATD):
+        try:
+            if now - os.path.getmtime(os.path.join(BEATD, fn)) <= HEARTBEAT_TTL:
+                live.add(fn)
+        except OSError:
+            pass
+    return live
+
+
+def reply_target_path(key):
+    return os.path.join(STATE_DIR, "reply." + key)
+
+
+def set_reply_target(key, mid):
+    """Remember the message_id of the user's latest message to this session so the
+    next outbound send() threads onto it (Telegram reply). Persists until a newer
+    inbound message overwrites it."""
+    if not mid:
+        return
+    ensure_dir()
+    try:
+        with open(reply_target_path(key), "w") as f:
+            f.write(str(mid))
+    except OSError:
+        pass
+
+
+def get_reply_target(key):
+    try:
+        with open(reply_target_path(key)) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
 
 
 class Lock:
@@ -143,11 +199,15 @@ def chat_id():
     return load_cfg().get("chat_id")
 
 
-def _send_chunk(text):
+def _send_chunk(text, reply_to=None):
+    base = {"chat_id": chat_id(), "text": text}
+    if reply_to:
+        base["reply_to_message_id"] = reply_to
+        base["allow_sending_without_reply"] = True  # don't error if it was deleted
     try:
-        r = api("sendMessage", {"chat_id": chat_id(), "text": text, "parse_mode": "Markdown"})
+        r = api("sendMessage", dict(base, parse_mode="Markdown"))
     except Exception:
-        r = api("sendMessage", {"chat_id": chat_id(), "text": text})
+        r = api("sendMessage", base)
     return (r.get("result") or {}).get("message_id")
 
 
@@ -169,9 +229,12 @@ def cmd_send(arg):
     if not text:
         die('usage: tg.py send "text"   (or: ... | tg.py send -)')
     text = label_prefix() + text
+    beat()  # an actively-sending session counts as live for strict-reply routing
+    rt = get_reply_target(session_key())  # thread onto the user's last message to us
     mids = []
     for i in range(0, len(text), 4000):
-        mid = _send_chunk(text[i:i + 4000])
+        mid = _send_chunk(text[i:i + 4000], reply_to=rt)
+        rt = None  # only the first chunk threads; the rest are plain continuations
         if mid:
             mids.append(mid)
     record_mids(mids)
@@ -255,18 +318,35 @@ def _pump(timeout):
         text = msg.get("text")
         if not text:
             continue
-        to = "*"
         rt = msg.get("reply_to_message")
         if rt:
+            # Explicit reply: route to the owning session (or broadcast if unknown).
             to = sm.get(str(rt.get("message_id")), "*")
-        items.append({"to": to, "text": text, "ts": now, "uid": uid_})
+        elif len(live_sessions()) >= 2:
+            # Strict-reply: with multiple sessions listening, a plain (un-replied)
+            # message is ambiguous — hold it (don't deliver to a random session) and
+            # nudge the user to reply to a specific session's message.
+            to = AMBIGUOUS
+            try:
+                _send_chunk("🤔 Несколько сессий слушают — непонятно, кому это. "
+                            "Ответь реплаем на сообщение нужной сессии.",
+                            reply_to=msg.get("message_id"))
+            except Exception:
+                pass
+        else:
+            to = "*"
+        items.append({"to": to, "text": text, "ts": now, "uid": uid_,
+                      "mid": msg.get("message_id")})
         seen.add(uid_)
     kept = []
     for it in items:
         age = now - it.get("ts", now)
         if age > INBOX_TTL:
             continue
-        if age > ROUTED_TTL:
+        # A reply to a session that never claimed downgrades to broadcast so a live
+        # session can pick it up. Ambiguous holds are intentionally NOT downgraded —
+        # the user must reply to disambiguate.
+        if age > ROUTED_TTL and it.get("to") != AMBIGUOUS:
             it["to"] = "*"
         kept.append(it)
     write_inbox(kept)          # durable inbox FIRST ...
@@ -280,6 +360,9 @@ def _claim(key):
     if not mine:
         return None
     write_inbox(rest)
+    in_mids = [it.get("mid") for it in mine if it.get("mid")]
+    if in_mids:
+        set_reply_target(key, max(in_mids))  # next send() threads onto the latest
     return "\n".join(it["text"] for it in mine)
 
 
@@ -287,6 +370,7 @@ def cmd_recv(timeout):
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
     with Lock():
+        beat()
         _pump(timeout)
         out = _claim(session_key())
     if out is None:
@@ -300,6 +384,7 @@ def cmd_listen(maxsecs):
     start = time.time()
     while time.time() - start < maxsecs:
         with Lock():
+            beat()
             _pump(5)
             out = _claim(session_key())
         if out is not None:
@@ -316,6 +401,7 @@ def cmd_ask(text, budget):
     start = time.time()
     while time.time() - start < budget:
         with Lock():
+            beat()
             _pump(5)
             out = _claim(session_key())
         if out is not None:

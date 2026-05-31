@@ -147,6 +147,74 @@ class RoutingTests(unittest.TestCase):
         self.api.updates = [upd(4, "to anyone")]
         self.assertEqual(self._recv_as("whoever"), "to anyone")
 
+    def test_send_threads_onto_last_inbound(self):
+        # after a session claims a message, its next send() replies onto that message
+        self._send_as("sessA", "q from A")
+        self.api.updates = [upd(8, "do the thing", reply_to=self.api._mid)]
+        self.assertEqual(self._recv_as("sessA"), "do the thing")
+        # incoming user message_id is 9000+8 = 9008; the reply must thread onto it
+        self.api.sent.clear()
+        self._send_as("sessA", "on it")
+        params = self.api.sent[-1][1]
+        self.assertEqual(params.get("reply_to_message_id"), 9008)
+        self.assertTrue(params.get("allow_sending_without_reply"))
+
+    def test_send_without_inbound_is_not_a_reply(self):
+        # a fresh session that never claimed anything sends a plain (unthreaded) message
+        self._send_as("loneSession", "hello world")
+        params = self.api.sent[-1][1]
+        self.assertNotIn("reply_to_message_id", params)
+
+    def test_label_is_bold_header_on_own_line(self):
+        os.environ.pop("TG_LABEL", None)
+        os.environ["TG_CWD"] = "/Users/x/gitroot/demoproj"
+        try:
+            self.tg.cmd_send("hello body")
+        finally:
+            os.environ.pop("TG_CWD", None)
+        text = self.api.sent[-1][1]["text"]
+        self.assertTrue(text.startswith("*demoproj*\n"))
+        self.assertEqual(text, "*demoproj*\nhello body")
+
+    def test_two_live_sessions_hold_plain(self):
+        # 2+ sessions listening -> a plain (no-reply) message is held, not delivered,
+        # and the user gets a disambiguation nudge.
+        self.tg.beat("sessA")
+        self.tg.beat("sessB")
+        self.api.updates = [upd(10, "ambiguous plain")]
+        with self.tg.Lock():
+            self.tg._pump(0)
+        self.assertIsNone(self._recv_as("sessA"))
+        self.assertIsNone(self._recv_as("sessB"))
+        hint = [s for s in self.api.sent if "реплаем" in (s[1] or {}).get("text", "")]
+        self.assertEqual(len(hint), 1)  # nudge sent exactly once
+
+    def test_one_live_session_plain_broadcasts(self):
+        # only one session listening -> plain message still broadcasts (no regression).
+        self.tg.beat("solo")
+        self.api.updates = [upd(11, "plain to solo")]
+        self.assertEqual(self._recv_as("solo"), "plain to solo")
+
+    def test_ambiguous_not_downgraded_to_broadcast(self):
+        # a held ambiguous message must NOT become broadcast after ROUTED_TTL.
+        old_ts = int(time.time()) - (self.tg.ROUTED_TTL + 60)
+        self.tg.write_inbox([{"to": self.tg.AMBIGUOUS, "text": "held",
+                              "ts": old_ts, "uid": 12}])
+        with self.tg.Lock():
+            self.tg._pump(0)
+        items = self.tg.read_inbox()
+        self.assertEqual(items[0]["to"], self.tg.AMBIGUOUS)
+        self.assertIsNone(self._recv_as("anySession"))
+
+    def test_reply_still_routes_with_two_live(self):
+        # explicit reply must keep working even when multiple sessions are live.
+        self.tg.beat("sessA")
+        self.tg.beat("sessB")
+        mid = self._send_as("sessA", "q from A")
+        self.api.updates = [upd(13, "answer A", reply_to=mid)]
+        self.assertIsNone(self._recv_as("sessB"))
+        self.assertEqual(self._recv_as("sessA"), "answer A")
+
     def test_dead_session_downgrade(self):
         # message routed to a session that never claims; after ROUTED_TTL (but before
         # INBOX_TTL) it is downgraded to broadcast so a live session can pick it up
