@@ -177,6 +177,19 @@ class RoutingTests(unittest.TestCase):
         params = self.api.sent[-1][1]
         self.assertNotIn("reply_to_message_id", params)
 
+    def test_send_thread_false_is_not_a_reply(self):
+        # the SessionStart announcement must be a standalone message even when a
+        # stale reply target exists, since the replied-to message may be gone.
+        self.tg.set_reply_target("sessA", 4242)  # a leftover target from before
+        os.environ["TG_KEY"] = "sessA"
+        os.environ.pop("TG_CWD", None)
+        self.tg.cmd_send("session announcement", thread=False)
+        params = self.api.sent[-1][1]
+        self.assertNotIn("reply_to_message_id", params)
+        # sanity: with thread=True it WOULD have threaded onto 4242
+        self.tg.cmd_send("a reply", thread=True)
+        self.assertEqual(self.api.sent[-1][1].get("reply_to_message_id"), 4242)
+
     def test_label_is_bold_header_on_own_line(self):
         os.environ.pop("TG_LABEL", None)
         os.environ["TG_CWD"] = "/Users/x/gitroot/demoproj"
@@ -229,6 +242,23 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(items[0]["to"], "busySession")
         # when the intended session finally listens, it claims its own message
         self.assertEqual(self._recv_as("busySession"), "for busy only")
+
+    def test_listen_singleton_exits_4_when_already_running(self):
+        # a second listener for the same session must exit 4 (not 3), so the caller
+        # can tell "already listening" apart from "timed out, relaunch".
+        import fcntl
+        key = "sessSingleton"
+        os.environ["TG_KEY"] = key
+        os.environ.pop("TG_CWD", None)
+        lock_path = os.path.join(self.tmp, "listen." + key + ".lock")
+        held = open(lock_path, "w")
+        fcntl.flock(held, fcntl.LOCK_EX)  # simulate an already-running listener
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self.tg.cmd_listen(1)
+            self.assertEqual(cm.exception.code, 4)
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN); held.close()
 
     def test_expired_message_dropped_not_reassigned(self):
         # an unclaimed addressed message expires at INBOX_TTL; it is never broadcast.

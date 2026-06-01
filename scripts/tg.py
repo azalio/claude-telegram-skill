@@ -23,7 +23,9 @@ Usage:
   tg.py hook stop|userprompt|notification|sessionstart   (reads hook JSON on stdin)
 
 Env: TG_CWD / TG_LABEL set the per-session routing key and the outbound label.
-Exit codes: 0 ok, 2 config missing/invalid, 3 timeout/no-message, 1 other.
+Exit codes: 0 ok (message printed), 2 config missing/invalid, 3 timeout/no-message
+(relaunch once), 4 a listener for this session is already running (do nothing),
+1 other.
 """
 import sys, os, json, time, fcntl, subprocess, io, contextlib, urllib.parse, urllib.request
 
@@ -200,14 +202,17 @@ def record_mids(mids):
         _append_sent(mids, session_key())
 
 
-def cmd_send(arg):
+def cmd_send(arg, thread=True):
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
     text = sys.stdin.read() if arg == "-" else (arg or "")
     if not text:
         die('usage: tg.py send "text"   (or: ... | tg.py send -)')
     text = label_prefix() + text
-    rt = get_reply_target(session_key())  # thread onto the user's last message to us
+    # Thread onto the user's last message to us — but only if asked. A standalone
+    # message (e.g. the SessionStart announcement) must NOT reply, since there may
+    # be no prior message, or only a stale id from an earlier session.
+    rt = get_reply_target(session_key()) if thread else None
     mids = []
     for i in range(0, len(text), 4000):
         mid = _send_chunk(text[i:i + 4000], reply_to=rt)
@@ -362,7 +367,10 @@ def cmd_listen(maxsecs):
     try:
         fcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        sys.exit(3)  # a listener for this session is already running
+        # A listener for this session is already running. Exit 4 (NOT 3) so the
+        # caller can tell "already listening — do nothing" apart from "timed out
+        # with no message — relaunch once".
+        sys.exit(4)
     start = time.time()
     while time.time() - start < maxsecs:
         # Hold the shared lock only for an instant: _pump(0) returns immediately
@@ -553,7 +561,7 @@ def hook_sessionstart(inp):
            % (label, sid or "?", cwd))
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            cmd_send(msg)
+            cmd_send(msg, thread=False)  # standalone announcement — never a reply
     except Exception:
         pass
     # Pin TG_CWD in the commands so the listener's routing key matches the startup
@@ -571,10 +579,15 @@ def hook_sessionstart(inp):
         "terminal first):\n"
         "     %s%s send 'your reply'   (single quotes — avoid backticks)\n"
         "Then act on the message; if it takes a while, send progress/results to Telegram too.\n"
-        "3. Then IMMEDIATELY relaunch the listener (step 1). If it exited with no output, just relaunch.\n"
+        "3. Then relaunch the listener (step 1) — keep EXACTLY ONE running for this session.\n"
+        "Handle the listener's exit code (do NOT just relaunch on every wake):\n"
+        "  - exit 0: it printed a message -> do step 2, then relaunch once.\n"
+        "  - exit 3: timed out, no message -> relaunch once (quietly, no investigation).\n"
+        "  - exit 4: a listener for this session is already running -> do NOTHING, do not relaunch.\n"
         "Cheap: the background task uses no model tokens while waiting; you wake only on a message. "
-        "The user targets a session by replying (Telegram reply-to) to its message. Stop only if asked "
-        "to stop listening. Never block the terminal." % (pre, tg, pre, tg)
+        "The user targets a session by replying (Telegram reply-to) to its message; a message that "
+        "isn't a reply we can attribute is dropped, never guessed. Stop only if asked to stop "
+        "listening. Never block the terminal." % (pre, tg, pre, tg)
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
