@@ -38,17 +38,24 @@ listener running for the whole session:
    ```
    It blocks cheaply (a flock-coordinated poll loop — only one session calls Telegram
    at a time) until a message routed to THIS session arrives, then prints it and exits.
-2. When the task completes, the harness re-invokes you with its output: that text is
-   the user's Telegram message. Act on it and reply (single quotes — never backticks):
-   ```bash
-   ~/.claude/telegram/tg send 'your reply'
-   ```
-3. **Immediately relaunch** the listener (step 1). If it exited with no output, just relaunch.
+   A per-session singleton lock guarantees at most one listener per session.
+2. When the task completes, **branch on its exit code** — don't blindly relaunch:
+   - **exit 0** — it printed a message. Your **first** action is to reply in Telegram
+     to acknowledge (single quotes — never backticks), *then* act on it:
+     ```bash
+     ~/.claude/telegram/tg send 'your reply'
+     ```
+     Then relaunch the listener (step 1).
+   - **exit 3** — timed out, no message. Relaunch once, quietly (this is normal idle).
+   - **exit 4** — a listener for this session is already running. Do **nothing** — do
+     not relaunch (this is the singleton lock preventing pile-up).
 
-The terminal stays usable throughout. The user targets a session by **replying
-(Telegram reply-to) to that session's message**; non-reply messages go to whichever
-session grabs them first. Only messages from the configured user_id are accepted.
-Stop only if the user says to stop listening (don't relaunch).
+Keep **exactly one** listener per session. The terminal stays usable throughout. The
+user targets a session by **replying (Telegram reply-to) to that session's message**.
+Routing is by reply-id only: a message that isn't a reply, or replies to something we
+can't attribute to a session, is **dropped** (with a one-line nudge) — never guessed
+or broadcast. Only messages from the configured user_id are accepted. Stop only if the
+user says to stop listening (don't relaunch).
 
 ## Mode 1 — notify when done
 
@@ -97,8 +104,11 @@ is mirrored to Telegram once. Cancelled the instant the user types in the termin
 
 Telegram's `getUpdates` is single-consumer with one destructive offset, so one
 session at a time (exclusive `flock`) **pumps** all updates into a shared inbox,
-tagging each with the target session (via `reply_to` → sent-message map). Each
-session **claims** only its own (or broadcast `*`) messages. Inbox is written+fsync'd
-before the offset advances (crashes duplicate, never lose); updates de-duped by
-`update_id`; a reply unclaimed >10min is downgraded to broadcast; `flock`
-auto-releases on death.
+tagging each with the target session via its `reply_to` id looked up in the
+sent-message map (`sent.map`, which records **every** outbound id — replies, nudges,
+notifications — so it has no holes). Each session **claims** only messages tagged for
+it. **Routing is by reply-id alone — no guessing, no broadcast:** a message that isn't
+a reply, or replies to an id we can't attribute, is dropped (the user gets a one-line
+nudge to reply to a session). Inbox is written+fsync'd before the offset advances
+(crashes duplicate, never lose); updates de-duped by `update_id`; unclaimed messages
+expire after 1h; `flock` auto-releases on death.

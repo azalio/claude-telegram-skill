@@ -230,6 +230,23 @@ class RoutingTests(unittest.TestCase):
         # when the intended session finally listens, it claims its own message
         self.assertEqual(self._recv_as("busySession"), "for busy only")
 
+    def test_listen_singleton_exits_4_when_already_running(self):
+        # a second listener for the same session must exit 4 (not 3), so the caller
+        # can tell "already listening" apart from "timed out, relaunch".
+        import fcntl
+        key = "sessSingleton"
+        os.environ["TG_KEY"] = key
+        os.environ.pop("TG_CWD", None)
+        lock_path = os.path.join(self.tmp, "listen." + key + ".lock")
+        held = open(lock_path, "w")
+        fcntl.flock(held, fcntl.LOCK_EX)  # simulate an already-running listener
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self.tg.cmd_listen(1)
+            self.assertEqual(cm.exception.code, 4)
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN); held.close()
+
     def test_expired_message_dropped_not_reassigned(self):
         # an unclaimed addressed message expires at INBOX_TTL; it is never broadcast.
         old_ts = int(time.time()) - (self.tg.INBOX_TTL + 60)
