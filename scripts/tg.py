@@ -202,14 +202,17 @@ def record_mids(mids):
         _append_sent(mids, session_key())
 
 
-def cmd_send(arg):
+def cmd_send(arg, thread=True):
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
     text = sys.stdin.read() if arg == "-" else (arg or "")
     if not text:
         die('usage: tg.py send "text"   (or: ... | tg.py send -)')
     text = label_prefix() + text
-    rt = get_reply_target(session_key())  # thread onto the user's last message to us
+    # Thread onto the user's last message to us — but only if asked. A standalone
+    # message (e.g. the SessionStart announcement) must NOT reply, since there may
+    # be no prior message, or only a stale id from an earlier session.
+    rt = get_reply_target(session_key()) if thread else None
     mids = []
     for i in range(0, len(text), 4000):
         mid = _send_chunk(text[i:i + 4000], reply_to=rt)
@@ -558,7 +561,7 @@ def hook_sessionstart(inp):
            % (label, sid or "?", cwd))
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            cmd_send(msg)
+            cmd_send(msg, thread=False)  # standalone announcement — never a reply
     except Exception:
         pass
     # Pin TG_CWD in the commands so the listener's routing key matches the startup

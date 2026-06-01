@@ -1,7 +1,7 @@
 {
   "name": "telegram-bridge",
   "description": "Two-way Telegram bridge for Claude Code: notify when work finishes, and chat with Claude over Telegram while away — every session always listening, coordinated by a file lock so only one polls at a time. No daemon.",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "author": {
     "name": "azalio"
   },
