@@ -68,7 +68,8 @@ class StructureTests(unittest.TestCase):
         self.assertNotIn("hooks", p)
 
     def test_marketplace_json(self):
-        m = json.load(open(MARKET_JSON))
+        with open(MARKET_JSON) as f:
+            m = json.load(f)
         self.assertIn("name", m)
         self.assertIn("owner", m)
         names = [pl["name"] for pl in m["plugins"]]
@@ -77,7 +78,8 @@ class StructureTests(unittest.TestCase):
             self.assertIn("source", pl)
 
     def test_hooks_json(self):
-        h = json.load(open(HOOKS_JSON))["hooks"]
+        with open(HOOKS_JSON) as f:
+            h = json.load(f)["hooks"]
         for ev in ("SessionStart", "Stop", "UserPromptSubmit", "Notification"):
             self.assertIn(ev, h)
             cmd = h[ev][0]["hooks"][0]["command"]
@@ -85,7 +87,8 @@ class StructureTests(unittest.TestCase):
             self.assertIn("scripts/tg.py", cmd)
 
     def test_skill_frontmatter(self):
-        body = open(SKILL_MD).read()
+        with open(SKILL_MD) as f:
+            body = f.read()
         self.assertTrue(body.startswith("---"))
         fm = body.split("---", 2)[1]
         self.assertRegex(fm, r"(?m)^name:\s*telegram\s*$")
@@ -93,7 +96,8 @@ class StructureTests(unittest.TestCase):
 
     def test_tg_py_parses(self):
         import ast
-        ast.parse(open(TG_PY).read())
+        with open(TG_PY) as f:
+            ast.parse(f.read())
 
 
 class RoutingTests(unittest.TestCase):
@@ -118,7 +122,8 @@ class RoutingTests(unittest.TestCase):
 
     def test_send_records_message_id(self):
         mid = self._send_as("sessA", "hello")
-        sent_map = open(os.path.join(self.tmp, "sent.map")).read()
+        with open(os.path.join(self.tmp, "sent.map")) as f:
+            sent_map = f.read()
         self.assertIn("%s\tsessA" % mid, sent_map)
         self.assertEqual(self.api.sent[0][0], "sendMessage")
 
@@ -208,7 +213,8 @@ class RoutingTests(unittest.TestCase):
         self.api.updates = [upd(14, "stray, no reply")]
         with self.tg.Lock():
             self.tg._pump(0)
-        sent_map = open(os.path.join(self.tmp, "sent.map")).read()
+        with open(os.path.join(self.tmp, "sent.map")) as f:
+            sent_map = f.read()
         self.assertIn("%s\t__nudge__" % self.api._mid, sent_map)
 
     def test_reply_to_nudge_is_not_misrouted(self):
@@ -253,12 +259,18 @@ class RoutingTests(unittest.TestCase):
         lock_path = os.path.join(self.tmp, "listen." + key + ".lock")
         held = open(lock_path, "w")
         fcntl.flock(held, fcntl.LOCK_EX)  # simulate an already-running listener
+        code = None
         try:
-            with self.assertRaises(SystemExit) as cm:
+            try:
                 self.tg.cmd_listen(1)
-            self.assertEqual(cm.exception.code, 4)
+            except SystemExit as exc:
+                code = exc.code
+                fcntl.flock(held, fcntl.LOCK_UN); held.close(); held = None
+                exc.__traceback__ = None
         finally:
-            fcntl.flock(held, fcntl.LOCK_UN); held.close()
+            if held is not None:
+                fcntl.flock(held, fcntl.LOCK_UN); held.close()
+        self.assertEqual(code, 4)
 
     def test_expired_message_dropped_not_reassigned(self):
         # an unclaimed addressed message expires at INBOX_TTL; it is never broadcast.

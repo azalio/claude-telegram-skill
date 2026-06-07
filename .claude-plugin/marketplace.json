@@ -1,5 +1,6 @@
 {
   "name": "azalio",
+  "description": "Claude Code plugins by azalio, including telegram-bridge for Telegram notifications and two-way chat.",
   "owner": {
     "name": "azalio"
   },

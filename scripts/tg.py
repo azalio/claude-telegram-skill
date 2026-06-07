@@ -191,7 +191,11 @@ def _append_sent(mids, key):
     mids = [str(m) for m in mids if m]
     if not mids:
         return
-    lines = open(SENT).read().splitlines() if os.path.exists(SENT) else []
+    if os.path.exists(SENT):
+        with open(SENT) as f:
+            lines = f.read().splitlines()
+    else:
+        lines = []
     lines += ["%s\t%s" % (m, key) for m in mids]
     with open(SENT, "w") as f:
         f.write("\n".join(lines[-SENT_MAX:]) + "\n"); f.flush(); os.fsync(f.fileno())
@@ -370,31 +374,36 @@ def cmd_listen(maxsecs):
         # A listener for this session is already running. Exit 4 (NOT 3) so the
         # caller can tell "already listening — do nothing" apart from "timed out
         # with no message — relaunch once".
+        singleton.close()
         sys.exit(4)
-    start = time.time()
-    while time.time() - start < maxsecs:
-        # Hold the shared lock only for an instant: _pump(0) returns immediately
-        # instead of long-polling for 5s under the lock, so many sessions don't
-        # serialize behind a slow poll. Pacing comes from the sleep below.
-        with Lock():
-            _pump(0)
-            out = _claim(key)
-        if out is not None:
-            # Wrap the message so the agent can't miss that a Telegram reply is
-            # REQUIRED before doing anything else — enforces "came from Telegram ->
-            # answer in Telegram first" at the point the message is delivered.
-            tg = os.path.join(STATE_DIR, "tg")
-            cwd = os.environ.get("TG_CWD", "")
-            send = ("TG_CWD='%s' %s send '...'" % (cwd, tg)) if cwd else ("%s send '...'" % tg)
-            print("=== TELEGRAM MESSAGE — reply REQUIRED before acting ===\n"
-                  + out +
-                  "\n=== END. Your FIRST action MUST be to acknowledge in Telegram:\n"
-                  "    %s\n"
-                  "Only AFTER sending that, act on the message, then relaunch the "
-                  "listener. ===" % send)
-            return
-        time.sleep(1 + (int(time.time()) % 3))
-    sys.exit(3)
+    try:
+        start = time.time()
+        while time.time() - start < maxsecs:
+            # Hold the shared lock only for an instant: _pump(0) returns immediately
+            # instead of long-polling for 5s under the lock, so many sessions don't
+            # serialize behind a slow poll. Pacing comes from the sleep below.
+            with Lock():
+                _pump(0)
+                out = _claim(key)
+            if out is not None:
+                # Wrap the message so the agent can't miss that a Telegram reply is
+                # REQUIRED before doing anything else — enforces "came from Telegram ->
+                # answer in Telegram first" at the point the message is delivered.
+                tg = os.path.join(STATE_DIR, "tg")
+                cwd = os.environ.get("TG_CWD", "")
+                send = ("TG_CWD='%s' %s send '...'" % (cwd, tg)) if cwd else ("%s send '...'" % tg)
+                print("=== TELEGRAM MESSAGE — reply REQUIRED before acting ===\n"
+                      + out +
+                      "\n=== END. Your FIRST action MUST be to acknowledge in Telegram:\n"
+                      "    %s\n"
+                      "Only AFTER sending that, act on the message, then relaunch the "
+                      "listener. ===" % send)
+                return
+            time.sleep(1 + (int(time.time()) % 3))
+        sys.exit(3)
+    finally:
+        fcntl.flock(singleton, fcntl.LOCK_UN)
+        singleton.close()
 
 
 def cmd_ask(text, budget):
@@ -456,7 +465,8 @@ def cmd_away(action, d):
     elif action == "list":
         if os.path.isdir(AWAYD):
             for fn in os.listdir(AWAYD):
-                print(open(os.path.join(AWAYD, fn)).read())
+                with open(os.path.join(AWAYD, fn)) as f:
+                    print(f.read())
     else:
         die("usage: tg.py away {on|off|active|clear|list} [dir]")
 

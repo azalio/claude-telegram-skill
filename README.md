@@ -1,114 +1,256 @@
-# telegram-bridge — a Claude Code plugin
+# telegram-bridge for Claude Code
 
-Message Claude on Telegram when work finishes, and **chat with it two-way while away
-from the terminal** — non-blocking, with **every active session always listening**.
-Multiple concurrent sessions share one bot, coordinated by a file lock so only one
-polls Telegram at a time. No daemon, no server — just a bot token.
+Telegram-агент для Claude Code: Claude пишет тебе в Telegram, когда задача закончена, и может принимать ответы из Telegram, пока ты отошел от терминала.
 
-## Install
+Что получится после установки:
+
+- Claude сможет отправлять тебе сообщения, файлы и скриншоты в Telegram.
+- Ты сможешь отвечать Claude прямо в Telegram.
+- Несколько Claude Code сессий смогут пользоваться одним ботом.
+- Никакого сервера, демона и внешней базы. Только Telegram bot token и один Python-скрипт.
+
+## Быстрый старт
+
+Нужно примерно 5 минут.
+
+### 1. Установи плагин
+
+В Claude Code выполни:
 
 ```text
 /plugin marketplace add azalio/claude-telegram-skill
 /plugin install telegram-bridge@azalio
 ```
 
-Then configure the bot (state lives in `~/.claude/telegram/`, never inside the plugin):
+### 2. Создай Telegram-бота
+
+Открой [@BotFather](https://t.me/BotFather) в Telegram.
+
+Отправь:
+
+```text
+/newbot
+```
+
+BotFather попросит имя и username бота, потом выдаст token вида:
+
+```text
+123456789:AA...
+```
+
+### 3. Создай конфиг
+
+В терминале выполни:
 
 ```bash
-# 1) create a bot with @BotFather, copy the token
-# 2) put it in ~/.claude/telegram/config.json  (copy config.example.json there)
-# 3) send your bot any message (e.g. /start), then:
-~/.claude/telegram/tg setup     # auto-detects chat_id + user_id
+mkdir -p ~/.claude/telegram
+nano ~/.claude/telegram/config.json
 ```
 
-The SessionStart hook writes the `~/.claude/telegram/tg` launcher on first run.
+Вставь туда JSON и замени `PUT_YOUR_BOT_TOKEN_HERE` на token от BotFather:
 
-## Getting the config values
-
-`~/.claude/telegram/config.json` has five fields. Here is how to obtain each:
-
-| Field | What it is | How to get it |
-| --- | --- | --- |
-| `token` | Bot API token | In Telegram, message [@BotFather](https://t.me/BotFather) → `/newbot` → pick a name and username → it replies with a token like `123456789:AA...`. Re-issue anytime with `/token`. |
-| `chat_id` | Where messages are sent | Auto-filled by `tg setup` (see below). It is the chat between you and your bot. |
-| `user_id` | Allow-listed sender | Auto-filled by `tg setup`. Only messages **from this user id** are accepted, so a stranger who finds your bot can't drive your sessions. For a 1:1 bot it equals your own Telegram user id. |
-| `idle_mirror_secs` | Auto-mirror delay | Seconds with no terminal reply before the last message is pushed to Telegram once. Default `600` (10 min); set `0` to disable. |
-| `always_listen` | Always-on listener | `true` makes every session keep a background listener so you can chat at any time. `false` = notify-only. |
-
-### Step by step
-
-1. **Create the bot and copy the token.** Open [@BotFather](https://t.me/BotFather), send `/newbot`, follow the prompts, copy the token it gives you.
-2. **Write the token into the config.**
-   ```bash
-   mkdir -p ~/.claude/telegram
-   cp config.example.json ~/.claude/telegram/config.json   # from this repo
-   # then edit ~/.claude/telegram/config.json and paste your token into "token"
-   ```
-3. **Say hi to your bot.** Open the chat with your new bot in Telegram and send it any message (e.g. `/start`). This is required — Telegram only reveals your `chat_id`/`user_id` after you message the bot first.
-4. **Auto-detect `chat_id` and `user_id`.**
-   ```bash
-   ~/.claude/telegram/tg setup
-   # -> chat_id set to <n>, user_id <n>
-   ```
-   `setup` reads the bot's pending updates, takes the chat and sender of your latest message, and writes both ids into the config.
-
-> Prefer to fill the ids by hand? Send your bot a message, then open
-> `https://api.telegram.org/bot<token>/getUpdates` in a browser — `result[].message.chat.id`
-> is your `chat_id` and `result[].message.from.id` is your `user_id`. `tg setup` just
-> automates this.
-
-## What it does
-
-- **Notify on done** — "ping me on telegram when you finish" → a summary; also `file`/`photo`.
-- **Two-way chat, always on** — every session keeps a cheap background listener
-  (`tg listen`); it costs no model tokens while idle and wakes only when a message
-  arrives. Reply in Telegram and Claude continues. The terminal is never blocked.
-- **Auto-mirror** — after ~10 min with no terminal reply, the last message is pushed
-  to Telegram once.
-- **Multi-session routing** — address a specific session by *replying* (Telegram
-  reply-to) to its message. Inbound is serialized with `flock`, written before the
-  Telegram offset advances (crash-safe), de-duplicated by `update_id`, and accepts
-  messages only from your `user_id`. **Reply-id is the only routing signal — there
-  is no guessing and no broadcast.** A message that isn't a reply, or replies to a
-  message we can't attribute to a session, is dropped (with a one-line nudge to
-  reply to a session) rather than delivered to the wrong one.
-
-## How it works
-
-`getUpdates` is single-consumer with one destructive offset, so the lock holder
-**pumps** all updates into a shared inbox. Each message is routed **solely by its
-`reply_to` id** looked up in the sent-message map (`sent.map`), which records
-*every* outbound id (replies, nudges, notifications) so it has no holes. A reply to
-a known session is tagged for that session and waits (up to 1 h) until it next
-listens — it is never reassigned to another session. Anything we can't attribute is
-dropped. Each `tg listen` holds a per-session singleton lock (so listeners can't
-pile up) and pumps without holding the shared lock during the network poll (so many
-sessions don't serialize behind one slow poll).
-
-## Layout
-
-```
-.claude-plugin/plugin.json        plugin manifest (hooks → hooks/hooks.json)
-.claude-plugin/marketplace.json   this repo is its own marketplace
-skills/telegram/SKILL.md          the skill Claude reads
-scripts/tg.py                     all logic (stdlib only)
-hooks/hooks.json                  Stop / UserPromptSubmit / Notification / SessionStart
-tests/test_e2e.py                 e2e tests (run in CI, no token)
-config.example.json               copy to ~/.claude/telegram/config.json
+```json
+{
+  "token": "PUT_YOUR_BOT_TOKEN_HERE",
+  "chat_id": null,
+  "user_id": null,
+  "idle_mirror_secs": 600,
+  "always_listen": true
+}
 ```
 
-## Test
+Сохрани файл.
+
+### 4. Перезапусти Claude Code сессию
+
+Закрой текущую Claude Code сессию и открой новую.
+
+После старта плагин создаст удобную команду:
 
 ```bash
-python3 tests/test_e2e.py                 # structure + routing on mocks, no token
-claude plugin validate . --strict         # official schema validation
-claude --plugin-dir . -p "..." --bare     # load locally, headless
+~/.claude/telegram/tg
 ```
 
-CI (`.github/workflows/e2e`) runs the e2e tests on every push/PR.
+### 5. Напиши боту первым
 
-## Security
+Открой своего нового бота в Telegram и отправь ему любое сообщение, например:
 
-Your bot token, chat_id, user_id and all runtime state live in `~/.claude/telegram/`,
-outside the plugin and out of git. Only messages from your configured `user_id` are
-accepted. Never commit your token.
+```text
+/start
+```
+
+Это обязательно: Telegram не отдаст `chat_id` и `user_id`, пока ты сам не написал боту.
+
+### 6. Заверши настройку
+
+В терминале выполни:
+
+```bash
+~/.claude/telegram/tg setup
+```
+
+Должно появиться что-то вроде:
+
+```text
+chat_id set to 123456789, user_id 123456789
+```
+
+Готово.
+
+Проверь отправку:
+
+```bash
+~/.claude/telegram/tg send "test from Claude Code"
+```
+
+## Как пользоваться
+
+Самый простой способ: просто проси Claude писать тебе в Telegram.
+
+Примеры промптов:
+
+```text
+Сделай задачу и напиши мне в Telegram, когда закончишь.
+```
+
+```text
+Запусти тесты, исправь ошибки и пришли результат в Telegram.
+```
+
+```text
+Если понадобится мой ответ, спроси меня в Telegram.
+```
+
+```text
+Сделай исследование, а итоговый markdown-файл отправь мне в Telegram.
+```
+
+## Как писать Claude из Telegram
+
+Когда новая Claude Code сессия стартует, бот пришлет сообщение вида:
+
+```text
+Сессия на связи: project-name
+```
+
+Чтобы написать именно этой сессии, отвечай в Telegram реплаем на это сообщение или на любое сообщение этой сессии.
+
+Важно: обычное сообщение без reply не будет доставлено ни в какую сессию. Это сделано специально, чтобы один бот не отправил команду не тому Claude-процессу.
+
+## Что умеет команда `tg`
+
+После установки доступна команда:
+
+```bash
+~/.claude/telegram/tg <command>
+```
+
+Основные команды:
+
+| Команда | Что делает |
+| --- | --- |
+| `send "text"` | Отправить текст в Telegram |
+| `send -` | Прочитать текст из stdin и отправить |
+| `file <path> [caption]` | Отправить файл |
+| `photo <path> [caption]` | Отправить картинку |
+| `setup` | Автоматически записать `chat_id` и `user_id` в конфиг |
+| `listen [seconds]` | Ждать сообщение из Telegram для текущей сессии |
+| `ask "text" [seconds]` | Отправить вопрос и ждать ответ |
+| `drain` | Сбросить offset и очистить inbox |
+
+Примеры:
+
+```bash
+~/.claude/telegram/tg send "Готово, тесты прошли"
+~/.claude/telegram/tg file report.md "Отчет"
+~/.claude/telegram/tg photo screenshot.png "Скриншот"
+```
+
+## Как это работает
+
+Плагин состоит из одного Python-скрипта `scripts/tg.py` и Claude Code hooks.
+
+Hooks подключены на события:
+
+- `SessionStart`: создает launcher `~/.claude/telegram/tg` и объявляет сессию в Telegram.
+- `Stop`: может отправить последнее сообщение в Telegram, если ты долго не отвечаешь в терминале.
+- `UserPromptSubmit`: отменяет idle-mirror, когда ты вернулся в терминал.
+- `Notification`: отправляет Telegram-уведомление, если Claude ждет твоего ввода.
+
+Состояние хранится здесь:
+
+```text
+~/.claude/telegram/
+```
+
+Там лежат config, offset, inbox, locks и routing map. В репозитории токен не хранится.
+
+## Безопасность
+
+Плагин принимает входящие Telegram-сообщения только от `user_id`, который записан в `~/.claude/telegram/config.json`.
+
+Это значит:
+
+- Если кто-то найдет твоего бота, он не сможет управлять Claude без твоего Telegram user id.
+- Если у тебя несколько Claude Code сессий, сообщение доставляется только той сессии, на сообщение которой ты ответил reply.
+- Сообщения без reply не угадываются и не рассылаются всем сессиям.
+
+Никогда не коммить свой `~/.claude/telegram/config.json` и не публикуй bot token.
+
+## Настройки
+
+Файл настроек:
+
+```text
+~/.claude/telegram/config.json
+```
+
+Поля:
+
+| Поле | Значение |
+| --- | --- |
+| `token` | Token от BotFather |
+| `chat_id` | Telegram chat, куда отправлять сообщения. Заполняется через `tg setup` |
+| `user_id` | Единственный Telegram user, от которого принимаются команды. Заполняется через `tg setup` |
+| `idle_mirror_secs` | Через сколько секунд без ответа в терминале отправить последнее сообщение в Telegram. `600` = 10 минут, `0` = выключить |
+| `always_listen` | `true` = каждая Claude Code сессия может слушать Telegram |
+
+## Если что-то не работает
+
+Попроси claude починить и сделай PR ;).
+
+## Требования
+
+- Claude Code с поддержкой plugins.
+- Python 3.
+- macOS или Linux. На Windows используй WSL.
+- Telegram account и bot token от BotFather.
+
+Python-зависимостей нет: используется только standard library.
+
+## Структура репозитория
+
+```text
+.claude-plugin/plugin.json        Plugin manifest
+.claude-plugin/marketplace.json   Marketplace entry
+hooks/hooks.json                  Claude Code hooks
+skills/telegram/SKILL.md          Skill-инструкция для Claude
+scripts/tg.py                     Вся логика Telegram bridge
+config.example.json               Пример config.json
+tests/test_e2e.py                 E2E-тесты без token и сети
+docs/architecture.md              Техническая архитектура
+```
+
+## Проверка для разработчиков
+
+```bash
+python3 tests/test_e2e.py
+claude plugin validate . --strict
+claude --plugin-dir . -p "ping me on telegram when done" --bare
+```
+
+CI запускает `tests/test_e2e.py` на push и pull request. Telegram API в тестах замокан, настоящий token не нужен.
+
+## Лицензия
+
+MIT.
