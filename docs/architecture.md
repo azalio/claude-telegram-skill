@@ -167,10 +167,13 @@ No dedicated ADR files were found. The routing decisions are documented in
 
 ## Freshness
 
-Reviewed on 2026-06-04 against `README.md`, `.claude-plugin/plugin.json`,
-`hooks/hooks.json`, `skills/telegram/SKILL.md`, `scripts/tg.py`,
-`config.example.json`, and `tests/test_e2e.py`.
+Reviewed on 2026-06-21 against `README.md`, `.claude-plugin/plugin.json`,
+`.claude-plugin/marketplace.json`, `hooks/hooks.json`,
+`skills/telegram/SKILL.md`, `scripts/tg.py`, `config.example.json`, and
+`tests/test_e2e.py`.
 
-Refresh reason: daily architecture workflow found this active software project
-without either `docs/architecture.md` or `docs/ARCHITECTURE.md`, so the
-canonical architecture document was created at `docs/architecture.md`.
+Refresh reason: daily architecture workflow found the prior review at the edge
+of the roughly 14-day freshness window and newer tracked plugin/runtime changes
+from 2026-06-07. The current architecture still matches the small plugin shape:
+manifest and hooks load a single standard-library Telegram bridge script, while
+bot credentials and runtime state remain outside the checkout.
