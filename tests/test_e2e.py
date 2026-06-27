@@ -127,6 +127,10 @@ class StructureTests(unittest.TestCase):
         # maps the four events we bridge
         for needle in ("session.created", "session.idle", "chat.message", "permission.ask"):
             self.assertIn(needle, src)
+        # inbound is plugin-driven: poll tg.py recv + inject via SDK (no blocking listen)
+        self.assertIn("promptAsync", src)
+        self.assertIn('"recv"', src)
+        self.assertNotIn('"listen"', src)           # never spawns a blocking listener
 
 
 class RoutingTests(unittest.TestCase):
@@ -367,7 +371,8 @@ class AdapterTests(unittest.TestCase):
         with open(os.path.join(self.oc_dir, "AGENTS.md")) as f:
             agents = f.read()
         self.assertIn("<!-- telegram-bridge:begin -->", agents)
-        self.assertIn("Telegram always-listen is ON", agents)
+        self.assertIn("Telegram bridge is ON", agents)        # non-blocking opencode phrasing
+        self.assertNotIn("run_in_background", agents)         # no Claude-only listen loop
         # idempotent: reinstall keeps exactly one marked block
         self.tg.cmd_install("opencode")
         with open(os.path.join(self.oc_dir, "AGENTS.md")) as f:
@@ -393,11 +398,45 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(self.tg.notification_message({}))   # non-empty fallback
 
     def test_always_listen_text_phrasing(self):
+        # Only Claude Code is told to run the blocking `tg listen` loop (it has a true
+        # background task). Codex/opencode shells block the turn, so they must NOT.
         claude = self.tg.always_listen_text("/x/tg", "/cwd", "claude")
         self.assertIn("run_in_background", claude)
-        codex = self.tg.always_listen_text("/x/tg", "/cwd", "codex")
-        self.assertNotIn("run_in_background", codex)     # blocking shells can't background
-        self.assertIn("listen 600", codex)               # so they use a bounded timeout
+        self.assertIn("/x/tg listen", claude)
+        for agent in ("codex", "opencode"):
+            txt = self.tg.always_listen_text("/x/tg", "/cwd", agent)
+            self.assertNotIn("run_in_background", txt)
+            self.assertNotIn("/x/tg listen", txt)            # no launch of a blocking listener
+            self.assertNotIn("exit 0:", txt)                 # no listen-loop exit-code handling
+            self.assertIn("Do NOT run a blocking", txt)
+
+    def test_codex_stop_reinjects_pending_message(self):
+        # Codex inbound: a Telegram message waiting at turn end is emitted as a Stop-hook
+        # "block" decision so Codex re-injects it as the next prompt.
+        os.environ["TG_AGENT"] = "codex"
+        os.environ["TG_CWD"] = "/Users/x/proj"
+        key = self.tg.session_key()
+        self.tg.write_inbox([{"to": key, "text": "do the thing",
+                              "ts": int(time.time()), "uid": 1, "mid": 5}])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            injected = self.tg.stop_reinject("/Users/x/proj")
+        self.assertTrue(injected)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("do the thing", out["reason"])
+        # message was claimed exactly once -> no continuation loop
+        self.assertEqual(self.tg.read_inbox(), [])
+
+    def test_codex_stop_reinject_noop_when_empty(self):
+        os.environ["TG_AGENT"] = "codex"
+        os.environ["TG_CWD"] = "/Users/x/proj2"
+        self.tg.write_inbox([])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            injected = self.tg.stop_reinject("/Users/x/proj2")
+        self.assertFalse(injected)
+        self.assertEqual(buf.getvalue(), "")   # nothing printed -> turn ends normally
 
     def test_sessionstart_emits_additionalcontext(self):
         os.environ["TG_AGENT"] = "codex"
@@ -408,8 +447,9 @@ class AdapterTests(unittest.TestCase):
         out = json.loads(buf.getvalue())                 # only the envelope reaches stdout
         hso = out["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "SessionStart")
-        self.assertIn("always-listen", hso["additionalContext"])
-        self.assertIn("listen 600", hso["additionalContext"])   # codex phrasing injected
+        self.assertIn("Telegram bridge is ON", hso["additionalContext"])  # non-claude phrasing
+        self.assertIn("Do NOT run a blocking", hso["additionalContext"])
+        self.assertNotIn("run_in_background", hso["additionalContext"])    # never the listen loop
 
 
 if __name__ == "__main__":

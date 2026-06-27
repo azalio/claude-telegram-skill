@@ -181,9 +181,11 @@ Hooks подключены на события (имена событий у Cla
 
 Как именно подключается каждый агент:
 
-- **Claude Code** — плагин из этого репозитория, hooks из `hooks/hooks.json` (см. установку выше).
-- **Codex** — `python3 scripts/tg.py install codex` мёрджит хуки в `~/.codex/hooks.json`. Те же четыре события, та же логика. [docs/codex.md](docs/codex.md).
-- **opencode** — `python3 scripts/tg.py install opencode` ставит тонкий TS-плагин в `~/.config/opencode/plugin/`, который транслирует события opencode в те же обработчики `tg.py`. Always-listen инструкции пишутся в `AGENTS.md` (у opencode нет инъекции контекста на старте сессии). [docs/opencode.md](docs/opencode.md).
+- **Claude Code** — плагин из этого репозитория, hooks из `hooks/hooks.json` (см. установку выше). Inbound — фоновый `tg listen` (у Claude Code настоящая неблокирующая фоновая задача).
+- **Codex** — `python3 scripts/tg.py install codex` мёрджит хуки в `~/.codex/hooks.json`. Inbound: shell у Codex блокирует ход, поэтому ответы из Telegram доставляются на границе хода через `Stop`-хук (`decision:block` + `reason` как новый промпт). [docs/codex.md](docs/codex.md).
+- **opencode** — `python3 scripts/tg.py install opencode` ставит тонкий TS-плагин в `~/.config/opencode/plugin/`. Inbound: у opencode нет фонового shell, поэтому плагин держит poll-loop и инжектит входящие через `session.promptAsync`. Инструкции — в `AGENTS.md` (нет инъекции контекста на старте). [docs/opencode.md](docs/opencode.md).
+
+> Важно: только у Claude Code есть настоящая неблокирующая фоновая задача — поэтому **только** Claude запускает `tg listen`. У Codex и opencode shell блокирует ход, и `tg listen` заморозил бы сессию; их inbound устроен иначе (см. выше).
 
 Состояние хранится здесь:
 

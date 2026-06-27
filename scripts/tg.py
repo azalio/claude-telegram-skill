@@ -488,10 +488,43 @@ def _read_hook_input():
         return {}
 
 
+def stop_reinject(cwd):
+    """Codex inbound delivery at turn end. Codex has no background listener and its shell
+    blocks the turn (a `tg listen` would freeze it), but its Stop hook supports
+    `{"decision":"block","reason":...}` — the reason is fed back as the next user prompt.
+    So at turn end we pump Telegram once (non-blocking) and, if a message is waiting for
+    this session, emit that decision so Codex re-injects it as a new turn. Returns True
+    (and prints the decision) when it injected; the message is claimed exactly once, so
+    there is no continuation loop. Used only for Codex (opencode injects via its plugin)."""
+    if cwd:
+        os.environ["TG_CWD"] = cwd
+    try:
+        if chat_id() is None:
+            return False
+        with Lock():
+            _pump(0)
+            out = _claim(session_key())
+    except SystemExit:
+        return False
+    except Exception:
+        return False
+    if not out:
+        return False
+    reason = ("New Telegram message from the user — your FIRST action MUST be to reply in "
+              "Telegram (run the tg send command), then act on it:\n" + out)
+    print(json.dumps({"decision": "block", "reason": reason}))
+    return True
+
+
 def hook_stop(inp):
     cwd = inp.get("cwd", "")
     last = inp.get("last_assistant_message", "") or ""
     sid = "".join(ch if ch.isalnum() else "_" for ch in (inp.get("session_id", "") or ""))
+    # Codex delivers inbound Telegram replies at the turn boundary by re-injecting them
+    # as the next prompt (it cannot run a listener). If we injected, stop here — don't
+    # also arm the idle mirror, since the turn is about to continue.
+    if os.environ.get("TG_AGENT") == "codex" and stop_reinject(cwd):
+        return
     # In away mode the listener handles replies; otherwise arm the idle auto-mirror.
     if away_active(cwd):
         return
@@ -574,28 +607,37 @@ def ensure_launcher():
 
 
 def always_listen_text(tg, cwd, agent="claude"):
-    """The always-listen instruction block. Claude Code injects this as SessionStart
-    additionalContext; Codex does the same via its SessionStart hook; opencode has no
-    session-start context injection, so the same text is written into AGENTS.md at
-    install time. One source of truth keeps the three agents in sync.
+    """The always-listen instruction block, injected as SessionStart context (Claude
+    Code, Codex) or written into AGENTS.md at install time (opencode — it has no
+    session-start injection). One source of truth keeps the agents in sync.
 
-    Phrasing differs only in how the agent backgrounds the listener: Claude Code has a
-    true non-blocking background task, so it long-polls (default 6h); Codex/opencode
-    shell tools block the turn, so they use a bounded `listen 600` and re-run it."""
+    The inbound model is fundamentally different per agent and that is load-bearing:
+    only Claude Code has a true non-blocking background task that wakes the agent, so
+    ONLY Claude is told to run the `tg listen` poll loop. Codex and opencode shells
+    block the turn — a blocking `tg listen` would FREEZE the session — so they must
+    NOT run a listener; their inbound is delivered out-of-band (opencode by the
+    plugin's poll-and-inject, Codex by hook-driven delivery), and they only send."""
     pre = ("TG_CWD='%s' " % cwd) if cwd else ""
-    listen = "%s%s listen" % (pre, tg) if agent == "claude" else "%s%s listen 600" % (pre, tg)
     send = "%s%s send 'your reply'" % (pre, tg)
-    if agent == "claude":
-        bg = ("1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
-              "     %s\n" % listen)
-    else:
-        bg = ("1. Launch the listener as a background/detached shell task if your runtime supports "
-              "it; otherwise run it with the bounded timeout shown and re-run it when it returns:\n"
-              "     %s\n" % listen)
+    if agent != "claude":
+        return (
+            "Telegram bridge is ON for this session. Outbound notifications and the idle "
+            "auto-mirror are automatic, and incoming Telegram replies are delivered into "
+            "this session for you (opencode injects them via its plugin; Codex re-injects "
+            "them at the end of a turn). Do NOT run a blocking `tg listen` — on this runtime "
+            "it would freeze your turn.\n"
+            "When a Telegram message is delivered to you here, your FIRST action MUST be to "
+            "acknowledge it by replying in Telegram (single quotes — avoid backticks):\n"
+            "     %s\n"
+            "Then act on it. Proactively send progress and final results to Telegram with "
+            "`%s%s send '...'` as you work. Stop only if asked to stop." % (send, pre, tg)
+        )
+    listen = "%s%s listen" % (pre, tg)
     return (
         "Telegram always-listen is ON for this session. Early on your first turn, start "
         "listening and keep it up for the whole session:\n"
-        + bg +
+        "1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
+        "     %s\n"
         "2. When that task completes it printed a Telegram message routed to this session. "
         "Read its output. Your FIRST action MUST be to reply in Telegram to acknowledge "
         "you received it (this is REQUIRED — do not act, plan, or answer only in the "
@@ -610,7 +652,7 @@ def always_listen_text(tg, cwd, agent="claude"):
         "Cheap: the listener uses no model tokens while waiting; you wake only on a message. "
         "The user targets a session by replying (Telegram reply-to) to its message; a message that "
         "isn't a reply we can attribute is dropped, never guessed. Stop only if asked to stop "
-        "listening. Never block the terminal." % (send,)
+        "listening. Never block the terminal." % (listen, send)
     )
 
 
