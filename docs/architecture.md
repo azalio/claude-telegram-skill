@@ -2,11 +2,19 @@
 
 ## Overview
 
-`claude-telegram-skill` packages `telegram-bridge`, a Claude Code plugin that
-lets a user receive Telegram notifications from Claude sessions and reply back
-to a specific active session. It is intentionally small: plugin metadata and
-hook declarations load one standard-library Python script, while durable bot
-state lives under `~/.claude/telegram/` rather than inside the plugin checkout.
+`claude-telegram-skill` packages `telegram-bridge`, which lets a user receive
+Telegram notifications from terminal AI-agent sessions and reply back to a
+specific active session. It serves three agents from one runtime: **Claude Code**
+(plugin), **OpenAI Codex CLI** (hooks merged into `~/.codex/hooks.json`), and
+**opencode** (a thin TS plugin). It is intentionally small: each agent's hook
+mechanism loads one standard-library Python script (`scripts/tg.py`), while
+durable bot state lives under `~/.claude/telegram/` rather than inside any
+checkout, so one bot and one state dir serve all three agents at once.
+
+The runtime is agent-agnostic by design: routing identity and labels come from
+environment variables (`TG_CWD`/`TG_KEY`/`TG_LABEL`/`TG_AGENT`), and the same
+four hook handlers (`sessionstart`/`stop`/`userprompt`/`notification`) are driven
+by each agent's native hook system. Only thin per-agent adapters differ.
 
 ## Scope
 
@@ -15,16 +23,19 @@ In scope:
 - Claude Code plugin metadata and marketplace packaging.
 - A Telegram skill document that teaches Claude how to notify, listen, and
   reply safely.
+- Per-agent adapters: Claude Code hooks (`hooks/hooks.json`), a Codex hooks
+  template merged into `~/.codex/hooks.json`, and an opencode TS plugin — all
+  installed via `tg.py install codex|opencode` and routed into the same handlers.
 - Session hooks for start, stop, prompt submit, and notification events.
 - Standard-library Python Telegram bridge runtime with send, file, photo,
-  setup, receive, listen, ask, drain, away, and hook subcommands.
-- Multi-session inbound routing through reply-to message IDs, file locks, a
-  shared inbox, and a sent-message map.
+  setup, receive, listen, ask, drain, away, install, and hook subcommands.
+- Multi-session, multi-agent inbound routing through reply-to message IDs, file
+  locks, a shared inbox, and a sent-message map.
 - Offline e2e tests that mock Telegram API calls.
 
 Out of scope:
 
-- A daemon or server process separate from Claude sessions.
+- A daemon or server process separate from the agent sessions.
 - Storing bot tokens, chat IDs, offsets, inbox, or locks in the repository.
 - Supporting arbitrary Telegram users; inbound control is allow-listed by the
   configured `user_id`.
@@ -45,24 +56,29 @@ Out of scope:
 
 ## System Context
 
-Claude Code loads the plugin manifest and hook config from the repository.
-Session hooks invoke `scripts/tg.py`, which talks to the Telegram Bot API over
-HTTPS and stores runtime state under `~/.claude/telegram/` or `TG_STATE_DIR`.
-The human user talks to the bot from Telegram. Multiple Claude sessions can use
-one bot because `tg.py` coordinates `getUpdates` through `flock` and routes
-claimed messages by session key.
+Each agent loads its hook config and invokes `scripts/tg.py`: Claude Code from
+the plugin manifest and `hooks/hooks.json`, Codex from `~/.codex/hooks.json`,
+opencode through its TS plugin (which spawns `tg.py hook ...`). `tg.py` talks to
+the Telegram Bot API over HTTPS and stores runtime state under
+`~/.claude/telegram/` or `TG_STATE_DIR`. The human user talks to the bot from
+Telegram. Multiple sessions across all three agents can share one bot because
+`tg.py` coordinates `getUpdates` through `flock` and routes claimed messages by
+session key.
 
 ## Core Structure
 
 | Path | Responsibility |
 |------|----------------|
-| `.claude-plugin/plugin.json` | Plugin identity, description, version, repository, license, and keywords. |
-| `.claude-plugin/marketplace.json` | Local marketplace entry for installing the plugin from this repo. |
-| `hooks/hooks.json` | Claude hook declarations for `SessionStart`, `Stop`, `UserPromptSubmit`, and `Notification`. |
+| `.claude-plugin/plugin.json` | Claude Code plugin identity, description, version, repository, license, and keywords. |
+| `.claude-plugin/marketplace.json` | Local marketplace entry for installing the Claude Code plugin from this repo. |
+| `hooks/hooks.json` | Claude Code hook declarations for `SessionStart`, `Stop`, `UserPromptSubmit`, and `Notification`. |
+| `codex/hooks.json` | Codex hooks template (`__TG_PY__` placeholder); merged into `~/.codex/hooks.json` by `tg.py install codex`. `PermissionRequest` maps to the notification handler. |
+| `opencode/plugin/telegram-bridge.ts` | opencode TS plugin: maps `session.created`/`session.idle`/`chat.message`/`permission.ask` to `tg.py hook ...`; installed by `tg.py install opencode`. |
 | `skills/telegram/SKILL.md` | Skill instructions for sending notifications, running background listeners, and handling replies. |
-| `scripts/tg.py` | Standard-library Telegram bridge runtime and hook handler. |
-| `config.example.json` | Template copied to `~/.claude/telegram/config.json`. |
-| `tests/test_e2e.py` | Offline structure and routing tests with a fake Telegram API. |
+| `scripts/tg.py` | Standard-library Telegram bridge runtime, hook handlers, and the `install` subcommand. |
+| `config.example.json` | Template copied to `~/.claude/telegram/config.json` (shared by all agents). |
+| `tests/test_e2e.py` | Offline structure, install, helper, and routing tests with a fake Telegram API. |
+| `docs/codex.md`, `docs/opencode.md` | Per-agent setup guides. |
 
 ## Runtime Flows
 
@@ -124,6 +140,12 @@ claimed messages by session key.
 
 ## Cross-cutting Concepts
 
+- Agent-agnostic core + thin adapters: the four hook handlers and the routing
+  runtime are shared; each agent supplies only an adapter that feeds the same
+  stdin-JSON contract (`cwd`, `session_id`, `last_assistant_message`, etc.) and,
+  for Codex, consumes the same `hookSpecificOutput.additionalContext` envelope.
+  `TG_AGENT` tailors only the always-listen phrasing (true background task for
+  Claude Code vs bounded `listen 600` for the blocking shells of Codex/opencode).
 - State/code separation: plugin files are reinstallable; bot credentials and
   offsets are outside the repo.
 - Reply-to-only routing: inbound Telegram messages must reply to a bot message
@@ -155,9 +177,17 @@ claimed messages by session key.
   because there is no safe session target.
 - Markdown parse mode can fail for arbitrary text; the runtime retries without
   Markdown for plain sends.
-- Background listening depends on Claude/session tooling correctly handling
-  long-running background tasks and exit codes.
-- The e2e suite mocks Telegram and does not prove live Bot API connectivity.
+- Background listening depends on agent/session tooling correctly handling
+  long-running background tasks and exit codes. Only Claude Code has a true
+  non-blocking background task; Codex/opencode shells block the turn, so they use
+  a bounded `listen 600` loop instead of a single long poll.
+- opencode has no session-start context injection, so its always-listen
+  instructions are a static `AGENTS.md` block (rewritten on reinstall), not a
+  dynamic per-session injection like Claude Code's and Codex's `additionalContext`.
+- Codex gates non-managed hooks behind a per-hash trust prompt; a changed `tg.py`
+  must be re-trusted, and Codex's hooks subsystem is relatively new/version-sensitive.
+- The e2e suite mocks Telegram and does not prove live Bot API connectivity, nor
+  does it run the real Codex/opencode hook runtimes (it tests install + handlers).
 
 ## ADR Links
 
@@ -167,10 +197,15 @@ No dedicated ADR files were found. The routing decisions are documented in
 
 ## Freshness
 
-Reviewed on 2026-06-04 against `README.md`, `.claude-plugin/plugin.json`,
-`hooks/hooks.json`, `skills/telegram/SKILL.md`, `scripts/tg.py`,
-`config.example.json`, and `tests/test_e2e.py`.
+Reviewed on 2026-06-27 against `README.md`, `.claude-plugin/plugin.json`,
+`.claude-plugin/marketplace.json`, `hooks/hooks.json`, `codex/hooks.json`,
+`opencode/plugin/telegram-bridge.ts`, `skills/telegram/SKILL.md`,
+`scripts/tg.py`, `config.example.json`, `tests/test_e2e.py`, `docs/codex.md`,
+and `docs/opencode.md`.
 
-Refresh reason: daily architecture workflow found this active software project
-without either `docs/architecture.md` or `docs/ARCHITECTURE.md`, so the
-canonical architecture document was created at `docs/architecture.md`.
+Refresh reason: added Codex and opencode adapters. The runtime was generalized to
+be agent-agnostic (shared hook handlers + `install` subcommand + `TG_AGENT`
+phrasing), and per-agent adapters (Codex hooks template, opencode TS plugin) were
+introduced. The core shape is unchanged: a single standard-library Telegram bridge
+script serves all three agents, while bot credentials and runtime state remain
+outside any checkout.

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Telegram bridge for Claude Code — single-file, standard library only.
+"""Telegram bridge for Claude Code, Codex & opencode — single-file, std-lib only.
 
 One script handles everything: outbound (send/file/photo), inbound routing
 (pump/claim under an flock so multiple sessions share Telegram's single
-getUpdates consumer), the always-on background listener, and the Claude Code
-hooks (Stop / UserPromptSubmit / Notification / SessionStart).
+getUpdates consumer), the always-on background listener, and the agent hooks
+(Stop / UserPromptSubmit / Notification / SessionStart). The same hook handlers
+serve all three agents — Claude Code loads hooks/hooks.json, Codex gets its
+hooks merged into ~/.codex/hooks.json (tg.py install codex), and opencode gets a
+thin TS plugin that shells back into these handlers (tg.py install opencode).
 
 State lives in a stable dir (default ~/.claude/telegram, override with
 $TG_STATE_DIR) — never inside the plugin, so reinstalls/updates don't touch your
@@ -19,6 +22,7 @@ Usage:
   tg.py listen [maxsecs]          block (cheap) until a message for this session; print+exit
   tg.py ask "text" [budget]       send, then wait inline for the reply (loops recv)
   tg.py drain                     reset offset + clear inbox
+  tg.py install codex|opencode    wire hooks/plugin into ~/.codex or ~/.config/opencode
   tg.py away on|off|active|clear|list [dir]
   tg.py hook stop|userprompt|notification|sessionstart   (reads hook JSON on stdin)
 
@@ -40,6 +44,7 @@ IDLED = os.path.join(STATE_DIR, "idle.d")
 INBOX_TTL = 3600     # drop unclaimed messages after 1h
 SENT_MAX = 500
 SELF = os.path.abspath(__file__)
+REPO = os.path.dirname(os.path.dirname(SELF))  # repo root holds codex/ and opencode/ templates
 RETURN_PHRASES = ("вернул", "в терминал", "i'm back", "im back", "back to terminal", "/stop")
 
 
@@ -517,11 +522,28 @@ def hook_userprompt(inp):
             pass
 
 
+def notification_message(inp):
+    """Build a human notification line from a hook payload. Claude's Notification
+    hook carries `message`; Codex's PermissionRequest carries `tool_name` +
+    `tool_input` instead, so derive a line from those when `message` is absent."""
+    msg = inp.get("message")
+    if msg:
+        return msg
+    tool = inp.get("tool_name")
+    if tool:
+        detail = ""
+        ti = inp.get("tool_input")
+        if isinstance(ti, dict):
+            detail = ti.get("description") or ti.get("command") or ti.get("path") or ""
+        return "Нужно подтверждение: %s%s" % (tool, (" — " + str(detail)) if detail else "")
+    return "Агент ждёт твоего ввода."
+
+
 def hook_notification(inp):
     cwd = inp.get("cwd", "")
     if not away_active(cwd):
         return
-    msg = inp.get("message") or "Claude ждёт твоего ввода."
+    msg = notification_message(inp)
     os.environ["TG_CWD"] = cwd
     try:
         cmd_send("🔔 " + msg)
@@ -551,6 +573,47 @@ def ensure_launcher():
     return launcher
 
 
+def always_listen_text(tg, cwd, agent="claude"):
+    """The always-listen instruction block. Claude Code injects this as SessionStart
+    additionalContext; Codex does the same via its SessionStart hook; opencode has no
+    session-start context injection, so the same text is written into AGENTS.md at
+    install time. One source of truth keeps the three agents in sync.
+
+    Phrasing differs only in how the agent backgrounds the listener: Claude Code has a
+    true non-blocking background task, so it long-polls (default 6h); Codex/opencode
+    shell tools block the turn, so they use a bounded `listen 600` and re-run it."""
+    pre = ("TG_CWD='%s' " % cwd) if cwd else ""
+    listen = "%s%s listen" % (pre, tg) if agent == "claude" else "%s%s listen 600" % (pre, tg)
+    send = "%s%s send 'your reply'" % (pre, tg)
+    if agent == "claude":
+        bg = ("1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
+              "     %s\n" % listen)
+    else:
+        bg = ("1. Launch the listener as a background/detached shell task if your runtime supports "
+              "it; otherwise run it with the bounded timeout shown and re-run it when it returns:\n"
+              "     %s\n" % listen)
+    return (
+        "Telegram always-listen is ON for this session. Early on your first turn, start "
+        "listening and keep it up for the whole session:\n"
+        + bg +
+        "2. When that task completes it printed a Telegram message routed to this session. "
+        "Read its output. Your FIRST action MUST be to reply in Telegram to acknowledge "
+        "you received it (this is REQUIRED — do not act, plan, or answer only in the "
+        "terminal first):\n"
+        "     %s   (single quotes — avoid backticks)\n"
+        "Then act on the message; if it takes a while, send progress/results to Telegram too.\n"
+        "3. Then relaunch the listener (step 1) — keep EXACTLY ONE running for this session.\n"
+        "Handle the listener's exit code (do NOT just relaunch on every wake):\n"
+        "  - exit 0: it printed a message -> do step 2, then relaunch once.\n"
+        "  - exit 3: timed out, no message -> relaunch once (quietly, no investigation).\n"
+        "  - exit 4: a listener for this session is already running -> do NOTHING, do not relaunch.\n"
+        "Cheap: the listener uses no model tokens while waiting; you wake only on a message. "
+        "The user targets a session by replying (Telegram reply-to) to its message; a message that "
+        "isn't a reply we can attribute is dropped, never guessed. Stop only if asked to stop "
+        "listening. Never block the terminal." % (send,)
+    )
+
+
 def hook_sessionstart(inp):
     try:
         c = load_cfg()
@@ -577,28 +640,7 @@ def hook_sessionstart(inp):
     # Pin TG_CWD in the commands so the listener's routing key matches the startup
     # announcement's key even if you cd elsewhere — replies to this session's
     # message then reliably come back to THIS session.
-    pre = "TG_CWD='%s' " % cwd
-    ctx = (
-        "Telegram always-listen is ON for this session. Early on your first turn, start "
-        "listening and keep it up for the whole session:\n"
-        "1. Launch the listener as a background task (Bash tool, run_in_background: true):\n"
-        "     %s%s listen\n"
-        "2. When that task completes it printed a Telegram message routed to this session. "
-        "Read its output. Your FIRST action MUST be to reply in Telegram to acknowledge "
-        "you received it (this is REQUIRED — do not act, plan, or answer only in the "
-        "terminal first):\n"
-        "     %s%s send 'your reply'   (single quotes — avoid backticks)\n"
-        "Then act on the message; if it takes a while, send progress/results to Telegram too.\n"
-        "3. Then relaunch the listener (step 1) — keep EXACTLY ONE running for this session.\n"
-        "Handle the listener's exit code (do NOT just relaunch on every wake):\n"
-        "  - exit 0: it printed a message -> do step 2, then relaunch once.\n"
-        "  - exit 3: timed out, no message -> relaunch once (quietly, no investigation).\n"
-        "  - exit 4: a listener for this session is already running -> do NOTHING, do not relaunch.\n"
-        "Cheap: the background task uses no model tokens while waiting; you wake only on a message. "
-        "The user targets a session by replying (Telegram reply-to) to its message; a message that "
-        "isn't a reply we can attribute is dropped, never guessed. Stop only if asked to stop "
-        "listening. Never block the terminal." % (pre, tg, pre, tg)
-    )
+    ctx = always_listen_text(tg, cwd, os.environ.get("TG_AGENT", "claude"))
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
 
@@ -641,14 +683,100 @@ def cmd_idlewatch(sid, armed, cwd):
         pass
 
 
+# ---------- install (codex / opencode adapters) ----------
+def _entry_is_ours(entry):
+    """True if a hook entry points at THIS tg.py — used to drop stale copies on
+    reinstall so install stays idempotent."""
+    for h in (entry.get("hooks") or []):
+        if SELF in (h.get("command") or ""):
+            return True
+    return False
+
+
+def _upsert_block(path, block, begin, end):
+    """Write `block` (which itself contains the begin/end markers) into `path`,
+    replacing any previous marked block. Idempotent across reinstalls."""
+    cur = ""
+    if os.path.exists(path):
+        with open(path) as f:
+            cur = f.read()
+    if begin in cur and end in cur:
+        new = cur[:cur.index(begin)] + block + cur[cur.index(end) + len(end):]
+    else:
+        new = (cur + ("\n" if cur and not cur.endswith("\n") else "") + "\n" + block) if cur else block
+    with open(path, "w") as f:
+        f.write(new)
+
+
+def install_codex():
+    """Merge our hook entries into $CODEX_HOME/hooks.json (default ~/.codex). The
+    template's __TG_PY__ placeholder is resolved to this script's absolute path so the
+    hook works regardless of where the repo lives."""
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    os.makedirs(codex_home, exist_ok=True)
+    with open(os.path.join(REPO, "codex", "hooks.json")) as f:
+        ours = json.loads(f.read().replace("__TG_PY__", SELF)).get("hooks", {})
+    target = os.path.join(codex_home, "hooks.json")
+    existing = {}
+    if os.path.exists(target):
+        try:
+            with open(target) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    hooks = existing.get("hooks") or {}
+    for ev, entries in ours.items():
+        cur = [e for e in (hooks.get(ev) or []) if not _entry_is_ours(e)]
+        hooks[ev] = cur + entries
+    existing["hooks"] = hooks
+    with open(target, "w") as f:
+        json.dump(existing, f, indent=2)
+    print("codex hooks installed -> %s" % target)
+    print("Note: Codex gates non-managed hooks behind a trust prompt — approve them via "
+          "/hooks on first run (or start codex with --dangerously-bypass-hook-trust).")
+
+
+def install_opencode():
+    """Copy the TS plugin into $OPENCODE_CONFIG_DIR/plugin (default ~/.config/opencode)
+    and write the always-listen instructions into AGENTS.md — opencode has no
+    session-start context injection, so the instructions must be a static rule."""
+    cfg = os.environ.get("OPENCODE_CONFIG_DIR") or os.path.expanduser("~/.config/opencode")
+    plugin_dir = os.path.join(cfg, "plugin")
+    os.makedirs(plugin_dir, exist_ok=True)
+    with open(os.path.join(REPO, "opencode", "plugin", "telegram-bridge.ts")) as f:
+        code = f.read().replace("__TG_PY__", SELF)
+    dst = os.path.join(plugin_dir, "telegram-bridge.ts")
+    with open(dst, "w") as f:
+        f.write(code)
+    agents = os.path.join(cfg, "AGENTS.md")
+    block = ("<!-- telegram-bridge:begin -->\n## Telegram bridge\n\n"
+             + always_listen_text(os.path.join(STATE_DIR, "tg"), "", "opencode")
+             + "\n<!-- telegram-bridge:end -->\n")
+    _upsert_block(agents, block, "<!-- telegram-bridge:begin -->", "<!-- telegram-bridge:end -->")
+    print("opencode plugin installed -> %s" % dst)
+    print("always-listen instructions written -> %s" % agents)
+
+
+def cmd_install(agent):
+    ensure_launcher()  # make ~/.claude/telegram/tg exist now so the instructions resolve
+    if agent == "codex":
+        install_codex()
+    elif agent == "opencode":
+        install_opencode()
+    else:
+        die("usage: tg.py install {codex|opencode}")
+
+
 # ---------- dispatch ----------
 def main():
     a = sys.argv[1:]
     if not a:
-        die("usage: tg.py {setup|send|file|photo|recv|listen|ask|drain|away|hook}")
+        die("usage: tg.py {setup|send|file|photo|recv|listen|ask|drain|away|install|hook}")
     cmd = a[0]
     if cmd == "setup":
         cmd_setup()
+    elif cmd == "install":
+        cmd_install(a[1] if len(a) > 1 else "")
     elif cmd == "send":
         cmd_send(a[1] if len(a) > 1 else "")
     elif cmd == "file":

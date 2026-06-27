@@ -11,8 +11,8 @@
         "source": "github",
         "repo": "azalio/claude-telegram-skill"
       },
-      "description": "Two-way Telegram bridge for Claude Code: notify on done + always-listening non-blocking chat, multi-session, no daemon.",
-      "version": "1.0.8",
+      "description": "Two-way Telegram bridge for Claude Code: notify on done + always-listening non-blocking chat, multi-session, no daemon. Same runtime also bridges Codex and opencode.",
+      "version": "1.1.0",
       "author": {
         "name": "azalio"
       },
