@@ -60,14 +60,27 @@ Codex прячет недоверенные хуки за trust-гейтом. П
 
 | Событие Codex | Обработчик `tg.py` | Что делает |
 | --- | --- | --- |
-| `SessionStart` | `hook sessionstart` | announce + инъекция always-listen инструкций через `additionalContext` |
-| `Stop` | `hook stop` | arming idle-mirror последнего сообщения |
+| `SessionStart` | `hook sessionstart` | announce + инъекция инструкций через `additionalContext` |
+| `Stop` | `hook stop` | **inbound:** доставка входящего Telegram-сообщения + arming idle-mirror |
 | `UserPromptSubmit` | `hook userprompt` | отмена idle-mirror, когда ты в терминале |
 | `PermissionRequest` | `hook notification` | Telegram-уведомление, что агент ждёт подтверждения (только в режиме `away`) |
 
-`SessionStart` инжектит always-listen инструкции тем же форматом, что у Claude Code
-(`hookSpecificOutput.additionalContext`), поэтому Codex сам крутит `tg listen` и
-обрабатывает exit codes.
+### Inbound: как ответы из Telegram попадают в сессию
+
+Shell-инструмент Codex **блокирует ход**, пока команда не вернётся (а фоновый процесс
+умирает в конце хода), поэтому модель «агент сам крутит `tg listen`» Codex не подходит —
+она бы заморозила сессию. Вместо этого inbound идёт через `Stop`-хук:
+
+- В конце каждого хода `hook stop` делает один **неблокирующий** poll Telegram.
+- Если для этой сессии есть сообщение — хук возвращает `{"decision":"block","reason":<текст>}`.
+- Codex подставляет `reason` как **новый user-промпт**, и агент делает ещё ход (по инструкции
+  — сначала отвечает в Telegram через `tg send`, потом действует).
+
+Ограничение: доставка происходит на **границе хода**. Если ты ответишь, пока агент сидит
+полностью idle между ходами, сообщение подхватится при следующем Stop. Это особенность
+интерактивного Codex — программно «толкнуть» промпт в живую TUI-сессию извне нельзя
+(`codex inject` закрыт как not planned); полноценный while-idle inbound потребовал бы
+app-server-сессии, которой владеет мост.
 
 ## Особенности и ограничения
 
@@ -75,9 +88,7 @@ Codex прячет недоверенные хуки за trust-гейтом. П
   `tg.py` — подтверждаешь заново.
 - **`notify` не используется.** У Codex есть упрощённый `notify` (только
   `agent-turn-complete`), но хуки покрывают больше, поэтому интеграция идёт через хуки.
-- **Блокирующий shell.** В отличие от Claude Code, shell-инструмент Codex блокирует ход,
-  пока команда не вернётся, поэтому инструкции советуют `tg listen 600` (ограниченный
-  таймаут) с пере-запуском, а не бесконечный поллинг.
+- **Inbound — на границе хода**, не мгновенно в idle (см. выше).
 - **Версии.** Hooks в Codex относительно новые; был регресс с несрабатыванием
   `SessionStart`/`PreToolUse` в некоторых alpha-сборках. Если announce не приходит —
   проверь версию Codex и `/hooks`.

@@ -144,8 +144,14 @@ session key.
   runtime are shared; each agent supplies only an adapter that feeds the same
   stdin-JSON contract (`cwd`, `session_id`, `last_assistant_message`, etc.) and,
   for Codex, consumes the same `hookSpecificOutput.additionalContext` envelope.
-  `TG_AGENT` tailors only the always-listen phrasing (true background task for
-  Claude Code vs bounded `listen 600` for the blocking shells of Codex/opencode).
+- Per-agent inbound, because only Claude Code has a true non-blocking background
+  task. Claude Code runs `tg listen` (background poll that wakes the agent).
+  Codex/opencode shells block the turn, so they never run a listener: Codex
+  delivers a pending reply at turn end via a `Stop` hook `{"decision":"block",
+  "reason":...}` (the reason becomes the next prompt), and the opencode plugin
+  runs a process-lifetime poll loop that injects messages with
+  `session.promptAsync` while the session is idle. `TG_AGENT` selects the phrasing
+  and the Codex Stop-reinject path.
 - State/code separation: plugin files are reinstallable; bot credentials and
   offsets are outside the repo.
 - Reply-to-only routing: inbound Telegram messages must reply to a bot message
@@ -177,13 +183,17 @@ session key.
   because there is no safe session target.
 - Markdown parse mode can fail for arbitrary text; the runtime retries without
   Markdown for plain sends.
-- Background listening depends on agent/session tooling correctly handling
-  long-running background tasks and exit codes. Only Claude Code has a true
-  non-blocking background task; Codex/opencode shells block the turn, so they use
-  a bounded `listen 600` loop instead of a single long poll.
-- opencode has no session-start context injection, so its always-listen
-  instructions are a static `AGENTS.md` block (rewritten on reinstall), not a
-  dynamic per-session injection like Claude Code's and Codex's `additionalContext`.
+- Inbound differs sharply by agent because only Claude Code has a true
+  non-blocking background task. Codex/opencode shells block the turn, so a
+  blocking `tg listen` would freeze the session (observed). Codex inbound is
+  therefore turn-boundary only (the `Stop` hook re-injects a pending reply); a
+  message arriving while a Codex session sits fully idle is picked up at the next
+  turn end, not instantly. opencode inbound is plugin-driven via a poll loop +
+  `session.promptAsync`, gated on idle (a prompt to a busy session throws
+  `BusyError`; messages are buffered and re-tried on the next `session.idle`).
+- opencode has no session-start context injection, so its instructions are a
+  static `AGENTS.md` block (rewritten on reinstall), not a dynamic per-session
+  injection like Claude Code's and Codex's `additionalContext`.
 - Codex gates non-managed hooks behind a per-hash trust prompt; a changed `tg.py`
   must be re-trusted, and Codex's hooks subsystem is relatively new/version-sensitive.
 - The e2e suite mocks Telegram and does not prove live Bot API connectivity, nor
