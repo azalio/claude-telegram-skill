@@ -1,13 +1,15 @@
-# telegram-bridge for Claude Code
+# telegram-bridge for Claude Code, Codex & opencode
 
-Telegram-агент для Claude Code: Claude пишет тебе в Telegram, когда задача закончена, и может принимать ответы из Telegram, пока ты отошел от терминала.
+Telegram-мост для AI-агентов в терминале: агент пишет тебе в Telegram, когда задача закончена, и принимает ответы из Telegram, пока ты отошел от терминала. Один бот, одна логика (`scripts/tg.py`), три агента: **Claude Code**, **OpenAI Codex CLI** и **opencode**.
 
 Что получится после установки:
 
-- Claude сможет отправлять тебе сообщения, файлы и скриншоты в Telegram.
-- Ты сможешь отвечать Claude прямо в Telegram.
-- Несколько Claude Code сессий смогут пользоваться одним ботом.
+- Агент сможет отправлять тебе сообщения, файлы и скриншоты в Telegram.
+- Ты сможешь отвечать агенту прямо в Telegram.
+- Несколько сессий (в т.ч. разных агентов) смогут пользоваться одним ботом.
 - Никакого сервера, демона и внешней базы. Только Telegram bot token и один Python-скрипт.
+
+Установка ниже расписана для Claude Code. Для Codex и opencode — отдельные короткие гайды: [docs/codex.md](docs/codex.md), [docs/opencode.md](docs/opencode.md). Конфиг бота (`~/.claude/telegram/config.json`) общий для всех трёх.
 
 ## Быстрый старт
 
@@ -168,14 +170,20 @@ chat_id set to 123456789, user_id 123456789
 
 ## Как это работает
 
-Плагин состоит из одного Python-скрипта `scripts/tg.py` и Claude Code hooks.
+Вся логика — один Python-скрипт `scripts/tg.py` (только стандартная библиотека). Агенты подключаются к нему через свои механизмы хуков; обработчики хуков в `tg.py` одни и те же для всех трёх.
 
-Hooks подключены на события:
+Hooks подключены на события (имена событий у Claude Code и Codex совпадают):
 
 - `SessionStart`: создает launcher `~/.claude/telegram/tg` и объявляет сессию в Telegram.
 - `Stop`: может отправить последнее сообщение в Telegram, если ты долго не отвечаешь в терминале.
 - `UserPromptSubmit`: отменяет idle-mirror, когда ты вернулся в терминал.
-- `Notification`: отправляет Telegram-уведомление, если Claude ждет твоего ввода.
+- `Notification` (у Codex — `PermissionRequest`): отправляет Telegram-уведомление, если агент ждет твоего ввода (только в режиме `away`).
+
+Как именно подключается каждый агент:
+
+- **Claude Code** — плагин из этого репозитория, hooks из `hooks/hooks.json` (см. установку выше).
+- **Codex** — `python3 scripts/tg.py install codex` мёрджит хуки в `~/.codex/hooks.json`. Те же четыре события, та же логика. [docs/codex.md](docs/codex.md).
+- **opencode** — `python3 scripts/tg.py install opencode` ставит тонкий TS-плагин в `~/.config/opencode/plugin/`, который транслирует события opencode в те же обработчики `tg.py`. Always-listen инструкции пишутся в `AGENTS.md` (у opencode нет инъекции контекста на старте сессии). [docs/opencode.md](docs/opencode.md).
 
 Состояние хранится здесь:
 
@@ -221,24 +229,28 @@ Hooks подключены на события:
 
 ## Требования
 
-- Claude Code с поддержкой plugins.
+- Один из агентов: Claude Code (plugins), Codex CLI (hooks) или opencode (плагины + Bun).
 - Python 3.
 - macOS или Linux. На Windows используй WSL.
 - Telegram account и bot token от BotFather.
 
-Python-зависимостей нет: используется только standard library.
+Python-зависимостей нет: используется только standard library. У opencode-плагина рантайм-зависимостей тоже нет (`import type` стирается Bun на старте).
 
 ## Структура репозитория
 
 ```text
-.claude-plugin/plugin.json        Plugin manifest
-.claude-plugin/marketplace.json   Marketplace entry
+.claude-plugin/plugin.json        Plugin manifest (Claude Code)
+.claude-plugin/marketplace.json   Marketplace entry (Claude Code)
 hooks/hooks.json                  Claude Code hooks
 skills/telegram/SKILL.md          Skill-инструкция для Claude
-scripts/tg.py                     Вся логика Telegram bridge
+codex/hooks.json                  Codex hooks (шаблон, ставится через install codex)
+opencode/plugin/telegram-bridge.ts  opencode TS-плагин (ставится через install opencode)
+scripts/tg.py                     Вся логика Telegram bridge + install
 config.example.json               Пример config.json
 tests/test_e2e.py                 E2E-тесты без token и сети
 docs/architecture.md              Техническая архитектура
+docs/codex.md                     Установка для Codex
+docs/opencode.md                  Установка для opencode
 ```
 
 ## Проверка для разработчиков

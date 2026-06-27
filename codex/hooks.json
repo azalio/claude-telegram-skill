@@ -1,0 +1,17 @@
+{
+  "_comment": "Codex hooks for telegram-bridge. Installed with `tg.py install codex`, which merges these entries into $CODEX_HOME/hooks.json and replaces __TG_PY__ with the absolute path to scripts/tg.py. The same hook handlers serve Claude Code (hooks/hooks.json) and Codex; Codex's PermissionRequest maps to our notification handler. Codex gates non-managed hooks behind a trust prompt — approve via /hooks on first run.",
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume", "hooks": [ { "type": "command", "command": "TG_AGENT=codex python3 \"__TG_PY__\" hook sessionstart" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "TG_AGENT=codex python3 \"__TG_PY__\" hook stop" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "TG_AGENT=codex python3 \"__TG_PY__\" hook userprompt" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "TG_AGENT=codex python3 \"__TG_PY__\" hook notification" } ] }
+    ]
+  }
+}
