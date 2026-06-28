@@ -4,11 +4,8 @@ token, no network — the Telegram API is mocked. Run: python3 tests/test_e2e.py
 
 Covers:
   * plugin structure (plugin.json / marketplace.json / hooks.json / SKILL.md / tg.py)
-  * Codex & opencode adapter assets (codex/hooks.json, opencode TS plugin)
-  * `tg.py install codex|opencode`: merge into a temp CODEX_HOME / OPENCODE_CONFIG_DIR,
-    path substitution, idempotency
-  * agent-agnostic helpers: notification_message (Claude vs Codex payloads),
-    always_listen_text phrasing, the SessionStart additionalContext envelope
+  * helpers: notification_message, always_listen_text phrasing, the SessionStart
+    additionalContext envelope
   * inbound routing in tg.py: reply-to routing, user_id allowlist, update_id dedup,
     dead-session downgrade-to-broadcast, broadcast claim, outbound message_id recording.
 """
@@ -20,8 +17,6 @@ MARKET_JSON = os.path.join(REPO, ".claude-plugin", "marketplace.json")
 HOOKS_JSON = os.path.join(REPO, "hooks", "hooks.json")
 SKILL_MD = os.path.join(REPO, "skills", "telegram", "SKILL.md")
 TG_PY = os.path.join(REPO, "scripts", "tg.py")
-CODEX_HOOKS = os.path.join(REPO, "codex", "hooks.json")
-OPENCODE_PLUGIN = os.path.join(REPO, "opencode", "plugin", "telegram-bridge.ts")
 
 
 def load_tg(state_dir):
@@ -105,32 +100,6 @@ class StructureTests(unittest.TestCase):
         import ast
         with open(TG_PY) as f:
             ast.parse(f.read())
-
-    def test_codex_hooks_template(self):
-        with open(CODEX_HOOKS) as f:
-            h = json.load(f)["hooks"]
-        # Codex's PermissionRequest is our Notification analogue.
-        want = {"SessionStart": "sessionstart", "Stop": "stop",
-                "UserPromptSubmit": "userprompt", "PermissionRequest": "notification"}
-        for ev, sub in want.items():
-            self.assertIn(ev, h)
-            cmd = h[ev][0]["hooks"][0]["command"]
-            self.assertIn("__TG_PY__", cmd)          # resolved to an abs path at install
-            self.assertIn("TG_AGENT=codex", cmd)     # so phrasing/labels say Codex
-            self.assertIn("hook %s" % sub, cmd)
-
-    def test_opencode_plugin_asset(self):
-        with open(OPENCODE_PLUGIN) as f:
-            src = f.read()
-        self.assertIn("__TG_PY__", src)              # resolved to an abs path at install
-        self.assertIn("export const TelegramBridge", src)
-        # maps the four events we bridge
-        for needle in ("session.created", "session.idle", "chat.message", "permission.ask"):
-            self.assertIn(needle, src)
-        # inbound is plugin-driven: poll tg.py recv + inject via SDK (no blocking listen)
-        self.assertIn("promptAsync", src)
-        self.assertIn('"recv"', src)
-        self.assertNotIn('"listen"', src)           # never spawns a blocking listener
 
 
 class RoutingTests(unittest.TestCase):
@@ -315,131 +284,31 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(self.tg.read_inbox(), [])
 
 
-class AdapterTests(unittest.TestCase):
-    """The Codex & opencode adapters: `tg.py install`, idempotency, and the
-    agent-agnostic helpers that let one runtime serve all three agents."""
+class HelperTests(unittest.TestCase):
+    """The agent helpers: notification_message, always_listen_text phrasing, and
+    the SessionStart additionalContext envelope."""
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.tg = load_tg(os.path.join(self.tmp, "state"))
         self.api = FakeAPI()
         setattr(self.tg, "api", self.api)
-        self.codex_home = os.path.join(self.tmp, "codex")
-        self.oc_dir = os.path.join(self.tmp, "oc")
-        os.environ["CODEX_HOME"] = self.codex_home
-        os.environ["OPENCODE_CONFIG_DIR"] = self.oc_dir
 
     def tearDown(self):
-        for k in ("CODEX_HOME", "OPENCODE_CONFIG_DIR", "TG_AGENT", "TG_CWD"):
-            os.environ.pop(k, None)
+        os.environ.pop("TG_CWD", None)
 
-    def test_install_codex_merges_and_is_idempotent(self):
-        self.tg.cmd_install("codex")
-        path = os.path.join(self.codex_home, "hooks.json")
-        with open(path) as f:
-            h = json.load(f)["hooks"]
-        self.assertEqual(sorted(h),
-                         ["PermissionRequest", "SessionStart", "Stop", "UserPromptSubmit"])
-        cmd = h["SessionStart"][0]["hooks"][0]["command"]
-        self.assertIn(self.tg.SELF, cmd)          # placeholder resolved to abs path
-        self.assertNotIn("__TG_PY__", cmd)
-        # reinstall must not duplicate our entries
-        self.tg.cmd_install("codex")
-        with open(path) as f:
-            h2 = json.load(f)["hooks"]
-        self.assertEqual(len(h2["SessionStart"]), 1)
-        self.assertEqual(len(h2["Stop"]), 1)
-
-    def test_install_codex_preserves_foreign_hooks(self):
-        os.makedirs(self.codex_home, exist_ok=True)
-        path = os.path.join(self.codex_home, "hooks.json")
-        with open(path, "w") as f:
-            json.dump({"hooks": {"SessionStart": [
-                {"hooks": [{"type": "command", "command": "other-tool"}]}]}}, f)
-        self.tg.cmd_install("codex")
-        with open(path) as f:
-            entries = json.load(f)["hooks"]["SessionStart"]
-        cmds = [e["hooks"][0]["command"] for e in entries]
-        self.assertIn("other-tool", cmds)                       # foreign entry kept
-        self.assertTrue(any(self.tg.SELF in c for c in cmds))   # ours added
-
-    def test_install_opencode_writes_plugin_and_agents(self):
-        self.tg.cmd_install("opencode")
-        with open(os.path.join(self.oc_dir, "plugin", "telegram-bridge.ts")) as f:
-            src = f.read()
-        self.assertIn(self.tg.SELF, src)
-        self.assertNotIn("__TG_PY__", src)
-        with open(os.path.join(self.oc_dir, "AGENTS.md")) as f:
-            agents = f.read()
-        self.assertIn("<!-- telegram-bridge:begin -->", agents)
-        self.assertIn("Telegram bridge is ON", agents)        # non-blocking opencode phrasing
-        self.assertNotIn("run_in_background", agents)         # no Claude-only listen loop
-        # idempotent: reinstall keeps exactly one marked block
-        self.tg.cmd_install("opencode")
-        with open(os.path.join(self.oc_dir, "AGENTS.md")) as f:
-            self.assertEqual(f.read().count("<!-- telegram-bridge:begin -->"), 1)
-
-    def test_install_opencode_preserves_existing_agents(self):
-        os.makedirs(self.oc_dir, exist_ok=True)
-        with open(os.path.join(self.oc_dir, "AGENTS.md"), "w") as f:
-            f.write("# My rules\n\nkeep me\n")
-        self.tg.cmd_install("opencode")
-        with open(os.path.join(self.oc_dir, "AGENTS.md")) as f:
-            agents = f.read()
-        self.assertIn("keep me", agents)
-        self.assertIn("<!-- telegram-bridge:begin -->", agents)
-
-    def test_notification_message_from_claude_and_codex(self):
-        # Claude Notification carries `message`; Codex PermissionRequest carries tool data.
+    def test_notification_message(self):
         self.assertEqual(self.tg.notification_message({"message": "hi"}), "hi")
-        codex = self.tg.notification_message(
-            {"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}})
-        self.assertIn("Bash", codex)
-        self.assertIn("rm -rf x", codex)
         self.assertTrue(self.tg.notification_message({}))   # non-empty fallback
 
     def test_always_listen_text_phrasing(self):
-        # Only Claude Code is told to run the blocking `tg listen` loop (it has a true
-        # background task). Codex/opencode shells block the turn, so they must NOT.
-        claude = self.tg.always_listen_text("/x/tg", "/cwd", "claude")
-        self.assertIn("run_in_background", claude)
-        self.assertIn("/x/tg listen", claude)
-        for agent in ("codex", "opencode"):
-            txt = self.tg.always_listen_text("/x/tg", "/cwd", agent)
-            self.assertNotIn("run_in_background", txt)
-            self.assertNotIn("/x/tg listen", txt)            # no launch of a blocking listener
-            self.assertNotIn("exit 0:", txt)                 # no listen-loop exit-code handling
-            self.assertIn("Do NOT run a blocking", txt)
-
-    def test_codex_stop_reinjects_pending_message(self):
-        # Codex inbound: a Telegram message waiting at turn end is emitted as a Stop-hook
-        # "block" decision so Codex re-injects it as the next prompt.
-        os.environ["TG_AGENT"] = "codex"
-        os.environ["TG_CWD"] = "/Users/x/proj"
-        key = self.tg.session_key()
-        self.tg.write_inbox([{"to": key, "text": "do the thing",
-                              "ts": int(time.time()), "uid": 1, "mid": 5}])
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            injected = self.tg.stop_reinject("/Users/x/proj")
-        self.assertTrue(injected)
-        out = json.loads(buf.getvalue())
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("do the thing", out["reason"])
-        # message was claimed exactly once -> no continuation loop
-        self.assertEqual(self.tg.read_inbox(), [])
-
-    def test_codex_stop_reinject_noop_when_empty(self):
-        os.environ["TG_AGENT"] = "codex"
-        os.environ["TG_CWD"] = "/Users/x/proj2"
-        self.tg.write_inbox([])
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            injected = self.tg.stop_reinject("/Users/x/proj2")
-        self.assertFalse(injected)
-        self.assertEqual(buf.getvalue(), "")   # nothing printed -> turn ends normally
+        # Claude Code runs the `tg listen` loop as a non-blocking background task.
+        txt = self.tg.always_listen_text("/x/tg", "/cwd")
+        self.assertIn("run_in_background", txt)
+        self.assertIn("/x/tg listen", txt)
+        self.assertIn("exit 0:", txt)                       # listen-loop exit-code handling
+        self.assertIn("TG_CWD='/cwd'", txt)                 # cwd pinned into the commands
 
     def test_sessionstart_emits_additionalcontext(self):
-        os.environ["TG_AGENT"] = "codex"
         os.environ["TG_CWD"] = "/Users/x/proj"
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -447,9 +316,8 @@ class AdapterTests(unittest.TestCase):
         out = json.loads(buf.getvalue())                 # only the envelope reaches stdout
         hso = out["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "SessionStart")
-        self.assertIn("Telegram bridge is ON", hso["additionalContext"])  # non-claude phrasing
-        self.assertIn("Do NOT run a blocking", hso["additionalContext"])
-        self.assertNotIn("run_in_background", hso["additionalContext"])    # never the listen loop
+        self.assertIn("Telegram always-listen is ON", hso["additionalContext"])
+        self.assertIn("run_in_background", hso["additionalContext"])
 
 
 if __name__ == "__main__":
