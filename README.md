@@ -1,15 +1,13 @@
-# telegram-bridge for Claude Code, Codex & opencode
+# telegram-bridge for Claude Code
 
-Telegram-мост для AI-агентов в терминале: агент пишет тебе в Telegram, когда задача закончена, и принимает ответы из Telegram, пока ты отошел от терминала. Один бот, одна логика (`scripts/tg.py`), три агента: **Claude Code**, **OpenAI Codex CLI** и **opencode**.
+Telegram-мост для Claude Code в терминале: агент пишет тебе в Telegram, когда задача закончена, и принимает ответы из Telegram, пока ты отошел от терминала. Один бот, одна логика (`scripts/tg.py`).
 
 Что получится после установки:
 
-- Агент сможет отправлять тебе сообщения, файлы и скриншоты в Telegram.
-- Ты сможешь отвечать агенту прямо в Telegram.
-- Несколько сессий (в т.ч. разных агентов) смогут пользоваться одним ботом.
+- Claude сможет отправлять тебе сообщения, файлы и скриншоты в Telegram.
+- Ты сможешь отвечать Claude прямо в Telegram.
+- Несколько Claude Code сессий смогут пользоваться одним ботом.
 - Никакого сервера, демона и внешней базы. Только Telegram bot token и один Python-скрипт.
-
-Установка ниже расписана для Claude Code. Для Codex и opencode — отдельные короткие гайды: [docs/codex.md](docs/codex.md), [docs/opencode.md](docs/opencode.md). Конфиг бота (`~/.claude/telegram/config.json`) общий для всех трёх.
 
 ## Быстрый старт
 
@@ -170,22 +168,16 @@ chat_id set to 123456789, user_id 123456789
 
 ## Как это работает
 
-Вся логика — один Python-скрипт `scripts/tg.py` (только стандартная библиотека). Агенты подключаются к нему через свои механизмы хуков; обработчики хуков в `tg.py` одни и те же для всех трёх.
+Вся логика — один Python-скрипт `scripts/tg.py` (только стандартная библиотека). Claude Code подключается к нему через плагин и hooks из `hooks/hooks.json`.
 
-Hooks подключены на события (имена событий у Claude Code и Codex совпадают):
+Hooks подключены на события Claude Code:
 
 - `SessionStart`: создает launcher `~/.claude/telegram/tg` и объявляет сессию в Telegram.
 - `Stop`: может отправить последнее сообщение в Telegram, если ты долго не отвечаешь в терминале.
 - `UserPromptSubmit`: отменяет idle-mirror, когда ты вернулся в терминал.
-- `Notification` (у Codex — `PermissionRequest`): отправляет Telegram-уведомление, если агент ждет твоего ввода (только в режиме `away`).
+- `Notification`: отправляет Telegram-уведомление, если агент ждет твоего ввода (только в режиме `away`).
 
-Как именно подключается каждый агент:
-
-- **Claude Code** — плагин из этого репозитория, hooks из `hooks/hooks.json` (см. установку выше). Inbound — фоновый `tg listen` (у Claude Code настоящая неблокирующая фоновая задача).
-- **Codex** — `python3 scripts/tg.py install codex` мёрджит хуки в `~/.codex/hooks.json`. Inbound: shell у Codex блокирует ход, поэтому ответы из Telegram доставляются на границе хода через `Stop`-хук (`decision:block` + `reason` как новый промпт). [docs/codex.md](docs/codex.md).
-- **opencode** — `python3 scripts/tg.py install opencode` ставит тонкий TS-плагин в `~/.config/opencode/plugin/`. Inbound: у opencode нет фонового shell, поэтому плагин держит poll-loop и инжектит входящие через `session.promptAsync`. Инструкции — в `AGENTS.md` (нет инъекции контекста на старте). [docs/opencode.md](docs/opencode.md).
-
-> Важно: только у Claude Code есть настоящая неблокирующая фоновая задача — поэтому **только** Claude запускает `tg listen`. У Codex и opencode shell блокирует ход, и `tg listen` заморозил бы сессию; их inbound устроен иначе (см. выше).
+Inbound устроен через фоновый `tg listen`: у Claude Code есть настоящая неблокирующая фоновая задача, которая будит агента, когда приходит адресованное этой сессии сообщение.
 
 Состояние хранится здесь:
 
@@ -231,12 +223,12 @@ Hooks подключены на события (имена событий у Cla
 
 ## Требования
 
-- Один из агентов: Claude Code (plugins), Codex CLI (hooks) или opencode (плагины + Bun).
+- Claude Code (plugins).
 - Python 3.
 - macOS или Linux. На Windows используй WSL.
 - Telegram account и bot token от BotFather.
 
-Python-зависимостей нет: используется только standard library. У opencode-плагина рантайм-зависимостей тоже нет (`import type` стирается Bun на старте).
+Python-зависимостей нет: используется только standard library.
 
 ## Структура репозитория
 
@@ -245,14 +237,10 @@ Python-зависимостей нет: используется только st
 .claude-plugin/marketplace.json   Marketplace entry (Claude Code)
 hooks/hooks.json                  Claude Code hooks
 skills/telegram/SKILL.md          Skill-инструкция для Claude
-codex/hooks.json                  Codex hooks (шаблон, ставится через install codex)
-opencode/plugin/telegram-bridge.ts  opencode TS-плагин (ставится через install opencode)
-scripts/tg.py                     Вся логика Telegram bridge + install
+scripts/tg.py                     Вся логика Telegram bridge
 config.example.json               Пример config.json
 tests/test_e2e.py                 E2E-тесты без token и сети
 docs/architecture.md              Техническая архитектура
-docs/codex.md                     Установка для Codex
-docs/opencode.md                  Установка для opencode
 ```
 
 ## Проверка для разработчиков
