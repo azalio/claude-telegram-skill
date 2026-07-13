@@ -179,12 +179,14 @@ No dedicated ADR files were found. The routing decisions are documented in
 
 ## Freshness
 
-Reviewed on 2026-06-28 against `README.md`, `.claude-plugin/plugin.json`,
+Reviewed on 2026-07-13 against `README.md`, `.claude-plugin/plugin.json`,
 `.claude-plugin/marketplace.json`, `hooks/hooks.json`, `skills/telegram/SKILL.md`,
 `scripts/tg.py`, `config.example.json`, and `tests/test_e2e.py`.
 
-Refresh reason: removed the Codex and opencode adapters. The bridge is now
-Claude Code only — the per-agent install subcommand, the `TG_AGENT` phrasing
-branch, the Codex hooks template, and the opencode TS plugin were dropped. The
-core shape is unchanged: a single standard-library Telegram bridge script serves
-Claude Code, while bot credentials and runtime state remain outside any checkout.
+Refresh reason: stale-by-date refresh after confirming the current plugin
+contract is still Claude Code only (`telegram-bridge` 1.1.0). The earlier Codex
+and opencode adapters remain removed: the per-agent install subcommand, the
+`TG_AGENT` phrasing branch, the Codex hooks template, and the opencode TS plugin
+are not part of the current repo. The core shape is unchanged: a single
+standard-library Telegram bridge script serves Claude Code, while bot
+credentials and runtime state remain outside any checkout.
