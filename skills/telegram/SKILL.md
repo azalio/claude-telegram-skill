@@ -8,7 +8,8 @@ description: >
   session over Telegram and it replies, addressing a session by replying to its
   message; (3) auto-mirror the last message to Telegram after ~10 min of no terminal
   reply. Works across multiple concurrent sessions sharing one bot, coordinated by a
-  file lock so only one polls Telegram at a time. Bot token only; no daemon.
+  file lock so only one polls Telegram at a time. Bot token only; listeners are
+  bound to Claude Code session lifecycle.
 ---
 
 # Telegram bridge
@@ -39,7 +40,7 @@ listener running for the whole session:
    It blocks cheaply (a flock-coordinated poll loop — only one session calls Telegram
    at a time) until a message routed to THIS session arrives, then prints it and exits.
    A per-session singleton lock guarantees at most one listener per session.
-2. When the task completes, **branch on its exit code** — don't blindly relaunch:
+1. When the task completes, **branch on its exit code** — don't blindly relaunch:
    - **exit 0** — it printed a message. Your **first** action is to reply in Telegram
      to acknowledge (single quotes — never backticks), *then* act on it:
      ```bash
@@ -49,6 +50,8 @@ listener running for the whole session:
    - **exit 3** — timed out, no message. Relaunch once, quietly (this is normal idle).
    - **exit 4** — a listener for this session is already running. Do **nothing** — do
      not relaunch (this is the singleton lock preventing pile-up).
+   - **exit 5** — this session ended or was resumed as a new generation. Do
+     **nothing** — do not relaunch.
 
 Keep **exactly one** listener per session. The terminal stays usable throughout. The
 user targets a session by **replying (Telegram reply-to) to that session's message**.
@@ -56,6 +59,10 @@ Routing is by reply-id only: a message that isn't a reply, or replies to somethi
 can't attribute to a session, is **dropped** (with a one-line nudge) — never guessed
 or broadcast. Only messages from the configured user_id are accepted. Stop only if the
 user says to stop listening (don't relaunch).
+
+The `SessionEnd` hook invalidates this listener's session lease. The listener then
+exits on its next polling cycle, so it cannot outlive the Claude Code session that
+owns its background task. Resuming the same session creates a new lease generation.
 
 ## Mode 1 — notify when done
 
@@ -76,7 +83,8 @@ it in double quotes (the shell would run it). Use single quotes, or stdin:
 
 The Stop hook arms a cheap detached watcher: if you finish a turn and the user
 doesn't touch the terminal for `idle_mirror_secs` (default 600s), your last message
-is mirrored to Telegram once. Cancelled the instant the user types in the terminal.
+is mirrored to Telegram once. Cancelled when the user types in the terminal or when
+the owning Claude Code session ends.
 
 ## Setup (after installing the plugin)
 
@@ -88,11 +96,11 @@ is mirrored to Telegram once. Cancelled the instant the user types in the termin
 
 ## Config (~/.claude/telegram/config.json)
 
-| Key | Meaning |
-|---|---|
-| `token`, `chat_id`, `user_id` | Bot token; your chat; the only sender accepted |
-| `always_listen` | `true` = every session auto-starts the background listener |
-| `idle_mirror_secs` | Seconds of terminal idle before auto-mirroring (0 disables) |
+| Key                           | Meaning                                                     |
+| ----------------------------- | ----------------------------------------------------------- |
+| `token`, `chat_id`, `user_id` | Bot token; your chat; the only sender accepted              |
+| `always_listen`               | `true` = every session auto-starts the background listener  |
+| `idle_mirror_secs`            | Seconds of terminal idle before auto-mirroring (0 disables) |
 
 ## Commands (~/.claude/telegram/tg ...)
 
