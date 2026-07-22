@@ -21,14 +21,24 @@ Usage:
   tg.py ask "text" [budget]       send, then wait inline for the reply (loops recv)
   tg.py drain                     reset offset + clear inbox
   tg.py away on|off|active|clear|list [dir]
-  tg.py hook stop|userprompt|notification|sessionstart   (reads hook JSON on stdin)
+  tg.py hook stop|userprompt|notification|sessionstart|sessionend   (reads hook JSON on stdin)
 
-Env: TG_CWD / TG_LABEL set the per-session routing key and the outbound label.
+Env: TG_KEY / TG_SESSION_ID / TG_SESSION_LEASE bind managed workers to one
+session generation; TG_CWD / TG_LABEL set the outbound label.
 Exit codes: 0 ok (message printed), 2 config missing/invalid, 3 timeout/no-message
 (relaunch once), 4 a listener for this session is already running (do nothing),
-1 other.
+5 the owning session ended (do not relaunch), 1 other.
 """
-import sys, os, json, time, fcntl, subprocess, io, contextlib, urllib.parse, urllib.request
+import contextlib
+import fcntl
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
 
 STATE_DIR = os.environ.get("TG_STATE_DIR") or os.path.expanduser("~/.claude/telegram")
 CONFIG = os.path.join(STATE_DIR, "config.json")
@@ -38,8 +48,10 @@ INBOX = os.path.join(STATE_DIR, "inbox.jsonl")
 LOCKF = os.path.join(STATE_DIR, "lock")
 AWAYD = os.path.join(STATE_DIR, "away.d")
 IDLED = os.path.join(STATE_DIR, "idle.d")
+SESSIOND = os.path.join(STATE_DIR, "sessions.d")
 INBOX_TTL = 3600     # drop unclaimed messages after 1h
 SENT_MAX = 500
+SESSION_STATE_VERSION = 1
 SELF = os.path.abspath(__file__)
 
 
@@ -108,7 +120,9 @@ def get_offset():
 def set_offset(o):
     ensure_dir()
     with open(STATE, "w") as f:
-        f.write(str(o)); f.flush(); os.fsync(f.fileno())
+        f.write(str(o))
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def session_key():
@@ -128,6 +142,92 @@ def label_prefix():
 def marker_path(d):
     raw = d or os.getcwd()
     return os.path.join(AWAYD, "".join(ch if ch.isalnum() else "_" for ch in raw))
+
+
+def clean_session_id(raw):
+    return "".join(ch if ch.isalnum() else "_" for ch in (raw or ""))
+
+
+def session_state_path(sid):
+    return os.path.join(SESSIOND, clean_session_id(sid) + ".json")
+
+
+def read_session_state(sid):
+    if not sid:
+        return {}
+    try:
+        with open(session_state_path(sid)) as f:
+            state = json.load(f)
+        if state.get("schema_version") != SESSION_STATE_VERSION:
+            return {}
+        if state.get("session_id") != clean_session_id(sid):
+            return {}
+        return state
+    except Exception:
+        return {}
+
+
+def write_session_state(state):
+    os.makedirs(SESSIOND, exist_ok=True)
+    path = session_state_path(state["session_id"])
+    tmp = path + ".tmp-" + str(os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(state, f, sort_keys=True, separators=(",", ":"))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def start_session_lease(sid):
+    sid = clean_session_id(sid)
+    if not sid:
+        return ""
+    lease_id = "%d-%d" % (time.time_ns(), os.getpid())
+    write_session_state({
+        "schema_version": SESSION_STATE_VERSION,
+        "session_id": sid,
+        "lease_id": lease_id,
+        "status": "active",
+        "started_at": int(time.time()),
+    })
+    return lease_id
+
+
+def end_session_lease(sid):
+    sid = clean_session_id(sid)
+    state = read_session_state(sid)
+    if not state:
+        return
+    state["status"] = "ended"
+    state["ended_at"] = int(time.time())
+    write_session_state(state)
+
+
+def active_session_lease_id(sid):
+    state = read_session_state(sid)
+    if state.get("status") != "active":
+        return ""
+    return state.get("lease_id", "")
+
+
+def session_lease_active(sid, lease_id):
+    # Manual CLI usage has no session lease and keeps its existing timeout-based
+    # behavior. SessionStart-managed workers always provide both fields.
+    if not sid or not lease_id:
+        return True
+    return active_session_lease_id(sid) == lease_id
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def command_env_prefix(cwd="", sid="", lease_id=""):
+    values = (("TG_CWD", cwd), ("TG_KEY", sid), ("TG_SESSION_ID", sid),
+              ("TG_SESSION_LEASE", lease_id))
+    return " ".join("%s=%s" % (key, shell_quote(value))
+                    for key, value in values if value)
 
 
 def reply_target_path(key):
@@ -164,7 +264,8 @@ class Lock:
         return self
 
     def __exit__(self, *_):
-        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
 
 
 # ---------- outbound ----------
@@ -198,7 +299,9 @@ def _append_sent(mids, key):
         lines = []
     lines += ["%s\t%s" % (m, key) for m in mids]
     with open(SENT, "w") as f:
-        f.write("\n".join(lines[-SENT_MAX:]) + "\n"); f.flush(); os.fsync(f.fileno())
+        f.write("\n".join(lines[-SENT_MAX:]) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def record_mids(mids):
@@ -270,7 +373,8 @@ def write_inbox(items):
     with open(tmp, "w") as f:
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
-        f.flush(); os.fsync(f.fileno())
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, INBOX)
 
 
@@ -360,6 +464,10 @@ def cmd_recv(timeout):
 
 
 def cmd_listen(maxsecs):
+    sid = clean_session_id(os.environ.get("TG_SESSION_ID", ""))
+    lease_id = os.environ.get("TG_SESSION_LEASE", "")
+    if not session_lease_active(sid, lease_id):
+        sys.exit(5)
     if chat_id() is None:
         die("chat_id not set — run: tg.py setup", 2)
     key = session_key()
@@ -367,7 +475,8 @@ def cmd_listen(maxsecs):
     # key. If another listener for the same session is already running, exit at once
     # so listeners can't pile up (the lock auto-releases when this process exits).
     ensure_dir()
-    singleton = open(os.path.join(STATE_DIR, "listen." + key + ".lock"), "w")
+    generation = ("." + clean_session_id(lease_id)) if lease_id else ""
+    singleton = open(os.path.join(STATE_DIR, "listen." + key + generation + ".lock"), "w")
     try:
         fcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -379,11 +488,17 @@ def cmd_listen(maxsecs):
     try:
         start = time.time()
         while time.time() - start < maxsecs:
+            if not session_lease_active(sid, lease_id):
+                sys.exit(5)
             # Hold the shared lock only for an instant: _pump(0) returns immediately
             # instead of long-polling for 5s under the lock, so many sessions don't
             # serialize behind a slow poll. Pacing comes from the sleep below.
             with Lock():
+                if not session_lease_active(sid, lease_id):
+                    sys.exit(5)
                 _pump(0)
+                if not session_lease_active(sid, lease_id):
+                    sys.exit(5)
                 out = _claim(key)
             if out is not None:
                 # Wrap the message so the agent can't miss that a Telegram reply is
@@ -391,7 +506,8 @@ def cmd_listen(maxsecs):
                 # answer in Telegram first" at the point the message is delivered.
                 tg = os.path.join(STATE_DIR, "tg")
                 cwd = os.environ.get("TG_CWD", "")
-                send = ("TG_CWD='%s' %s send '...'" % (cwd, tg)) if cwd else ("%s send '...'" % tg)
+                prefix = command_env_prefix(cwd, sid, lease_id)
+                send = ((prefix + " ") if prefix else "") + "%s send '...'" % tg
                 print("=== TELEGRAM MESSAGE — reply REQUIRED before acting ===\n"
                       + out +
                       "\n=== END. Your FIRST action MUST be to acknowledge in Telegram:\n"
@@ -453,7 +569,9 @@ def cmd_away(action, d):
     mp = marker_path(me)
     if action == "on":
         os.makedirs(AWAYD, exist_ok=True)
-        open(mp, "w").write(me); print("away on: %s" % me)
+        with open(mp, "w") as f:
+            f.write(me)
+        print("away on: %s" % me)
     elif action in ("off", "clear"):
         try:
             os.remove(mp)
@@ -486,7 +604,7 @@ def _read_hook_input():
 def hook_stop(inp):
     cwd = inp.get("cwd", "")
     last = inp.get("last_assistant_message", "") or ""
-    sid = "".join(ch if ch.isalnum() else "_" for ch in (inp.get("session_id", "") or ""))
+    sid = clean_session_id(inp.get("session_id", ""))
     # In away mode the listener handles replies; otherwise arm the idle auto-mirror.
     if away_active(cwd):
         return
@@ -494,22 +612,26 @@ def hook_stop(inp):
         secs = int(load_cfg().get("idle_mirror_secs", 600))
     except Exception:
         secs = 600
-    if secs > 0 and sid:
+    lease_id = active_session_lease_id(sid)
+    if secs > 0 and sid and lease_id:
         os.makedirs(IDLED, exist_ok=True)
         with open(os.path.join(IDLED, "msg-" + sid), "w") as f:
             f.write(last)
-        env = dict(os.environ, TG_CWD=cwd)
-        subprocess.Popen([sys.executable, SELF, "_idlewatch", sid, str(int(time.time())), cwd],
+        env = dict(os.environ, TG_CWD=cwd, TG_KEY=sid, TG_SESSION_ID=sid,
+                   TG_SESSION_LEASE=lease_id)
+        subprocess.Popen([sys.executable, SELF, "_idlewatch", sid, str(int(time.time())), cwd,
+                          lease_id],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True, env=env)
 
 
 def hook_userprompt(inp):
     cwd = inp.get("cwd", "")
-    sid = "".join(ch if ch.isalnum() else "_" for ch in (inp.get("session_id", "") or ""))
+    sid = clean_session_id(inp.get("session_id", ""))
     if sid:
         os.makedirs(IDLED, exist_ok=True)
-        open(os.path.join(IDLED, "prompt-" + sid), "w").write(str(int(time.time())))
+        with open(os.path.join(IDLED, "prompt-" + sid), "w") as f:
+            f.write(str(int(time.time())))
     if cwd:
         try:
             os.remove(marker_path(cwd))
@@ -528,6 +650,14 @@ def hook_notification(inp):
         return
     msg = notification_message(inp)
     os.environ["TG_CWD"] = cwd
+    sid = clean_session_id(inp.get("session_id", ""))
+    if sid:
+        os.environ["TG_KEY"] = sid
+        os.environ["TG_SESSION_ID"] = sid
+        lease_id = active_session_lease_id(sid)
+        if not lease_id:
+            return
+        os.environ["TG_SESSION_LEASE"] = lease_id
     try:
         cmd_send("🔔 " + msg)
     except SystemExit:
@@ -556,11 +686,12 @@ def ensure_launcher():
     return launcher
 
 
-def always_listen_text(tg, cwd):
+def always_listen_text(tg, cwd, sid="", lease_id=""):
     """The always-listen instruction block, injected as SessionStart context for
     Claude Code — the one agent with a true non-blocking background task that wakes
     the agent, so it runs the `tg listen` poll loop."""
-    pre = ("TG_CWD='%s' " % cwd) if cwd else ""
+    prefix = command_env_prefix(cwd, sid, lease_id)
+    pre = (prefix + " ") if prefix else ""
     send = "%s%s send 'your reply'" % (pre, tg)
     listen = "%s%s listen" % (pre, tg)
     return (
@@ -579,6 +710,7 @@ def always_listen_text(tg, cwd):
         "  - exit 0: it printed a message -> do step 2, then relaunch once.\n"
         "  - exit 3: timed out, no message -> relaunch once (quietly, no investigation).\n"
         "  - exit 4: a listener for this session is already running -> do NOTHING, do not relaunch.\n"
+        "  - exit 5: the session ended or was resumed elsewhere -> do NOTHING, do not relaunch.\n"
         "Cheap: the listener uses no model tokens while waiting; you wake only on a message. "
         "The user targets a session by replying (Telegram reply-to) to its message; a message that "
         "isn't a reply we can attribute is dropped, never guessed. Stop only if asked to stop "
@@ -587,6 +719,8 @@ def always_listen_text(tg, cwd):
 
 
 def hook_sessionstart(inp):
+    sid = clean_session_id(inp.get("session_id", ""))
+    lease_id = start_session_lease(sid)
     try:
         c = load_cfg()
     except SystemExit:
@@ -598,25 +732,40 @@ def hook_sessionstart(inp):
     # message is also the reply-anchor for addressing this session. Suppress the
     # command's stdout so it doesn't corrupt the hook's JSON output.
     cwd = inp.get("cwd", "") or os.getcwd()
-    sid = (inp.get("session_id", "") or "")[:8]
     label = os.path.basename(cwd) or cwd
     os.environ["TG_CWD"] = cwd
+    if sid:
+        os.environ["TG_KEY"] = sid
+        os.environ["TG_SESSION_ID"] = sid
+    if lease_id:
+        os.environ["TG_SESSION_LEASE"] = lease_id
     msg = ("🟢 *Сессия на связи*: `%s`\nsid `%s` · `%s`\n"
            "Слушаю Telegram. _Ответь реплаем на это сообщение, чтобы писать именно этой сессии._"
-           % (label, sid or "?", cwd))
+           % (label, sid[:8] or "?", cwd))
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_send(msg, thread=False)  # standalone announcement — never a reply
     except Exception:
         pass
-    # Pin TG_CWD in the commands so the listener's routing key matches the startup
-    # announcement's key even if you cd elsewhere — replies to this session's
-    # message then reliably come back to THIS session.
-    ctx = always_listen_text(tg, cwd)
+    # Pin the session key and lease in every command. TG_CWD remains the display
+    # label, while replies route by session_id even when multiple sessions share it.
+    ctx = always_listen_text(tg, cwd, sid, lease_id)
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
 
 
-def cmd_idlewatch(sid, armed, cwd):
+def hook_sessionend(inp):
+    sid = clean_session_id(inp.get("session_id", ""))
+    if not sid:
+        return
+    end_session_lease(sid)
+    for prefix in ("msg-", "prompt-"):
+        try:
+            os.remove(os.path.join(IDLED, prefix + sid))
+        except OSError:
+            pass
+
+
+def cmd_idlewatch(sid, armed, cwd, lease_id=""):
     promptf = os.path.join(IDLED, "prompt-" + sid)
     msgf = os.path.join(IDLED, "msg-" + sid)
     try:
@@ -624,6 +773,8 @@ def cmd_idlewatch(sid, armed, cwd):
     except Exception:
         secs = 600
     if secs <= 0:
+        return
+    if not session_lease_active(sid, lease_id):
         return
 
     def returned():
@@ -635,16 +786,21 @@ def cmd_idlewatch(sid, armed, cwd):
 
     waited = 0
     while waited < secs:
-        if returned() or away_active(cwd):
+        if (not session_lease_active(sid, lease_id)
+                or returned() or away_active(cwd)):
             return
-        time.sleep(15); waited += 15
-    if returned():
+        time.sleep(15)
+        waited += 15
+    if not session_lease_active(sid, lease_id) or returned():
         return
     msg = ""
     if os.path.exists(msgf):
         with open(msgf) as f:
             msg = f.read()
     os.environ["TG_CWD"] = cwd
+    os.environ["TG_KEY"] = sid
+    os.environ["TG_SESSION_ID"] = sid
+    os.environ["TG_SESSION_LEASE"] = lease_id
     try:
         cmd_send("💤 %d мин без ответа:\n\n%s" % (secs // 60, msg or "Жду твоего ответа."))
     except Exception:
@@ -682,11 +838,12 @@ def main():
     elif cmd == "hook":
         ev = a[1] if len(a) > 1 else ""
         handler = {"stop": hook_stop, "userprompt": hook_userprompt,
-                   "notification": hook_notification, "sessionstart": hook_sessionstart}.get(ev)
+                   "notification": hook_notification, "sessionstart": hook_sessionstart,
+                   "sessionend": hook_sessionend}.get(ev)
         if handler:
             handler(_read_hook_input())
     elif cmd == "_idlewatch":
-        cmd_idlewatch(a[1], int(a[2]), a[3])
+        cmd_idlewatch(a[1], int(a[2]), a[3], a[4] if len(a) > 4 else "")
     else:
         die("unknown command: %s" % cmd)
 

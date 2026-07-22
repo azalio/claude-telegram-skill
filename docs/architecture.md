@@ -31,7 +31,7 @@ In scope:
 
 Out of scope:
 
-- A daemon or server process separate from the agent sessions.
+- A persistent daemon or server process separate from the agent sessions.
 - Storing bot tokens, chat IDs, offsets, inbox, or locks in the repository.
 - Supporting arbitrary Telegram users; inbound control is allow-listed by the
   configured `user_id`.
@@ -61,15 +61,15 @@ messages by session key.
 
 ## Core Structure
 
-| Path | Responsibility |
-|------|----------------|
-| `.claude-plugin/plugin.json` | Claude Code plugin identity, description, version, repository, license, and keywords. |
-| `.claude-plugin/marketplace.json` | Local marketplace entry for installing the Claude Code plugin from this repo. |
-| `hooks/hooks.json` | Claude Code hook declarations for `SessionStart`, `Stop`, `UserPromptSubmit`, and `Notification`. |
-| `skills/telegram/SKILL.md` | Skill instructions for sending notifications, running background listeners, and handling replies. |
-| `scripts/tg.py` | Standard-library Telegram bridge runtime and hook handlers. |
-| `config.example.json` | Template copied to `~/.claude/telegram/config.json`. |
-| `tests/test_e2e.py` | Offline structure, helper, and routing tests with a fake Telegram API. |
+| Path                              | Responsibility                                                                                                  |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `.claude-plugin/plugin.json`      | Claude Code plugin identity, description, version, repository, license, and keywords.                           |
+| `.claude-plugin/marketplace.json` | Local marketplace entry for installing the Claude Code plugin from this repo.                                   |
+| `hooks/hooks.json`                | Claude Code hook declarations for `SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit`, and `Notification`. |
+| `skills/telegram/SKILL.md`        | Skill instructions for sending notifications, running background listeners, and handling replies.               |
+| `scripts/tg.py`                   | Standard-library Telegram bridge runtime and hook handlers.                                                     |
+| `config.example.json`             | Template copied to `~/.claude/telegram/config.json`.                                                            |
+| `tests/test_e2e.py`               | Offline structure, helper, and routing tests with a fake Telegram API.                                          |
 
 ## Runtime Flows
 
@@ -77,46 +77,50 @@ messages by session key.
 
 1. The user installs the plugin and copies `config.example.json` to
    `~/.claude/telegram/config.json`.
-2. The user fills the bot token, messages the bot once, and runs
+1. The user fills the bot token, messages the bot once, and runs
    `~/.claude/telegram/tg setup`.
-3. `setup` reads Telegram updates, stores `chat_id` and `user_id`, and keeps the
+1. `setup` reads Telegram updates, stores `chat_id` and `user_id`, and keeps the
    config file mode restricted.
 
 ### Session Start and Listening
 
 1. `SessionStart` invokes `tg.py hook sessionstart`.
-2. The hook writes or refreshes the stable `~/.claude/telegram/tg` launcher.
-3. When `always_listen` is enabled, a session can start `tg listen` in the
+1. The hook writes or refreshes the stable `~/.claude/telegram/tg` launcher.
+1. The hook creates a versioned JSON lease generation for the exact
+   `session_id` and injects it into the listener command.
+1. When `always_listen` is enabled, a session can start `tg listen` in the
    background.
-4. A per-session singleton lock prevents multiple listeners for the same
-   session.
+1. A per-session-generation singleton lock prevents duplicate listeners while
+   allowing a resumed generation to replace a stale one immediately.
+1. `SessionEnd` marks the current lease ended. The listener observes that state,
+   exits with code `5`, and is not relaunched.
 
 ### Outbound Notification
 
 1. `tg send`, `tg file`, or `tg photo` loads the config and sends through the
    Telegram Bot API.
-2. Text messages are prefixed with the session label where available and split
+1. Text messages are prefixed with the session label where available and split
    into Telegram-sized chunks.
-3. Every outbound message ID is recorded in `sent.map`, including nudges and
+1. Every outbound message ID is recorded in `sent.map`, including nudges and
    notifications, so later replies can be attributed.
 
 ### Inbound Routing
 
 1. A listener or receive cycle obtains the shared lock.
-2. `_pump()` calls Telegram `getUpdates`, rejects unapproved `user_id`s, and
+1. `_pump()` calls Telegram `getUpdates`, rejects unapproved `user_id`s, and
    looks up each message's `reply_to_message.message_id` in `sent.map`.
-3. Attributed messages are written to `inbox.jsonl` and fsync'd before the
+1. Attributed messages are written to `inbox.jsonl` and fsync'd before the
    Telegram offset advances.
-4. The addressed session claims only messages tagged with its session key.
-5. Plain messages or replies to unknown/nudge IDs are dropped with a nudge
+1. The addressed session claims only messages tagged with its session key.
+1. Plain messages or replies to unknown/nudge IDs are dropped with a nudge
    rather than delivered to the wrong session.
 
 ### Idle Mirror
 
 1. The `Stop` hook can arm a detached idle watcher.
-2. If the terminal remains idle for `idle_mirror_secs`, the last message is
+1. If the terminal remains idle for `idle_mirror_secs`, the last message is
    mirrored to Telegram once.
-3. User terminal activity cancels the mirror.
+1. User terminal activity or `SessionEnd` cancels the mirror.
 
 ## Source of Truth
 
@@ -126,7 +130,8 @@ messages by session key.
 - Runtime behavior: `scripts/tg.py`.
 - User-facing skill contract: `skills/telegram/SKILL.md` and `README.md`.
 - Persistent runtime state: `~/.claude/telegram/` or `TG_STATE_DIR`, especially
-  `config.json`, `state`, `sent.map`, `inbox.jsonl`, locks, and reply targets.
+  `config.json`, `state`, `sent.map`, `inbox.jsonl`, locks, session leases, and
+  reply targets.
 - Regression evidence: `tests/test_e2e.py`.
 
 ## Cross-cutting Concepts
@@ -145,8 +150,9 @@ messages by session key.
   session pumps updates for all sessions.
 - Crash-safe inboxing: inbox writes happen before offset advancement, favoring
   duplicate handling over message loss.
-- Session labels and keys: environment variables such as `TG_KEY`, `TG_CWD`,
-  and `TG_LABEL` control routing identity and message headers.
+- Session labels, keys, and leases: `TG_KEY` carries the exact sanitized
+  `session_id`; `TG_SESSION_LEASE` distinguishes resume/compact generations;
+  `TG_CWD` and `TG_LABEL` control message headers.
 
 ## Deployment/Operations
 
@@ -157,8 +163,8 @@ messages by session key.
 - Run `python3 tests/test_e2e.py` for offline validation.
 - Run `claude plugin validate . --strict` where Claude's plugin validator is
   available.
-- The project has no build step and no runtime daemon; hooks and explicit skill
-  commands execute `scripts/tg.py` directly.
+- The project has no build step and no persistent runtime daemon; hooks and
+  lifecycle-bound worker commands execute `scripts/tg.py` directly.
 
 ## Known Risks/Gaps
 
@@ -179,14 +185,14 @@ No dedicated ADR files were found. The routing decisions are documented in
 
 ## Freshness
 
-Reviewed on 2026-07-13 against `README.md`, `.claude-plugin/plugin.json`,
+Reviewed on 2026-07-22 against `README.md`, `.claude-plugin/plugin.json`,
 `.claude-plugin/marketplace.json`, `hooks/hooks.json`, `skills/telegram/SKILL.md`,
 `scripts/tg.py`, `config.example.json`, and `tests/test_e2e.py`.
 
 Refresh reason: stale-by-date refresh after confirming the current plugin
-contract is still Claude Code only (`telegram-bridge` 1.1.0). The earlier Codex
+contract is still Claude Code only (`telegram-bridge` 1.1.1). The earlier Codex
 and opencode adapters remain removed: the per-agent install subcommand, the
 `TG_AGENT` phrasing branch, the Codex hooks template, and the opencode TS plugin
-are not part of the current repo. The core shape is unchanged: a single
-standard-library Telegram bridge script serves Claude Code, while bot
+are not part of the current repo. Session listeners and idle watchers are now
+bound to versioned `session_id` leases and stop after `SessionEnd`; bot
 credentials and runtime state remain outside any checkout.

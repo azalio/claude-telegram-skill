@@ -7,9 +7,19 @@ Covers:
   * helpers: notification_message, always_listen_text phrasing, the SessionStart
     additionalContext envelope
   * inbound routing in tg.py: reply-to routing, user_id allowlist, update_id dedup,
-    dead-session downgrade-to-broadcast, broadcast claim, outbound message_id recording.
+    lifecycle-bound listeners, strict session claims, outbound message_id recording.
 """
-import os, io, json, time, contextlib, tempfile, importlib.util, unittest
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_JSON = os.path.join(REPO, ".claude-plugin", "plugin.json")
@@ -39,9 +49,11 @@ class FakeAPI:
     def __init__(self):
         self.updates = []
         self.sent = []
+        self.calls = []
         self._mid = 1000
 
     def __call__(self, method, params=None, **kwargs):
+        self.calls.append(method)
         if method == "getUpdates":
             return {"ok": True, "result": list(self.updates)}
         if method in ("sendMessage", "sendDocument", "sendPhoto"):
@@ -72,17 +84,21 @@ class StructureTests(unittest.TestCase):
     def test_marketplace_json(self):
         with open(MARKET_JSON) as f:
             m = json.load(f)
+        with open(PLUGIN_JSON) as f:
+            plugin = json.load(f)
         self.assertIn("name", m)
         self.assertIn("owner", m)
         names = [pl["name"] for pl in m["plugins"]]
         self.assertIn("telegram-bridge", names)
         for pl in m["plugins"]:
             self.assertIn("source", pl)
+            if pl["name"] == "telegram-bridge":
+                self.assertEqual(pl["version"], plugin["version"])
 
     def test_hooks_json(self):
         with open(HOOKS_JSON) as f:
             h = json.load(f)["hooks"]
-        for ev in ("SessionStart", "Stop", "UserPromptSubmit", "Notification"):
+        for ev in ("SessionStart", "SessionEnd", "Stop", "UserPromptSubmit", "Notification"):
             self.assertIn(ev, h)
             cmd = h[ev][0]["hooks"][0]["command"]
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", cmd)
@@ -108,6 +124,11 @@ class RoutingTests(unittest.TestCase):
         self.tg = load_tg(self.tmp)
         self.api = FakeAPI()
         setattr(self.tg, "api", self.api)
+
+    def tearDown(self):
+        for key in ("TG_CWD", "TG_KEY", "TG_SESSION_ID", "TG_SESSION_LEASE"):
+            os.environ.pop(key, None)
+        shutil.rmtree(self.tmp)
 
     def _send_as(self, key, text):
         os.environ["TG_KEY"] = key
@@ -267,11 +288,14 @@ class RoutingTests(unittest.TestCase):
                 self.tg.cmd_listen(1)
             except SystemExit as exc:
                 code = exc.code
-                fcntl.flock(held, fcntl.LOCK_UN); held.close(); held = None
+                fcntl.flock(held, fcntl.LOCK_UN)
+                held.close()
+                held = None
                 exc.__traceback__ = None
         finally:
             if held is not None:
-                fcntl.flock(held, fcntl.LOCK_UN); held.close()
+                fcntl.flock(held, fcntl.LOCK_UN)
+                held.close()
         self.assertEqual(code, 4)
 
     def test_expired_message_dropped_not_reassigned(self):
@@ -294,7 +318,9 @@ class HelperTests(unittest.TestCase):
         setattr(self.tg, "api", self.api)
 
     def tearDown(self):
-        os.environ.pop("TG_CWD", None)
+        for key in ("TG_CWD", "TG_KEY", "TG_SESSION_ID", "TG_SESSION_LEASE"):
+            os.environ.pop(key, None)
+        shutil.rmtree(self.tmp)
 
     def test_notification_message(self):
         self.assertEqual(self.tg.notification_message({"message": "hi"}), "hi")
@@ -318,6 +344,201 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(hso["hookEventName"], "SessionStart")
         self.assertIn("Telegram always-listen is ON", hso["additionalContext"])
         self.assertIn("run_in_background", hso["additionalContext"])
+
+    def test_sessionend_stops_listener_generation(self):
+        sid = "session-123"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.tg.hook_sessionstart({"cwd": "/Users/x/proj", "session_id": sid})
+        context = json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+        lease_id = os.environ["TG_SESSION_LEASE"]
+        self.assertIn("TG_KEY='session_123'", context)
+        self.assertIn("TG_SESSION_LEASE='%s'" % lease_id, context)
+
+        self.tg.hook_sessionend({"cwd": "/Users/x/proj", "session_id": sid})
+        with self.assertRaises(SystemExit) as stopped:
+            self.tg.cmd_listen(10)
+        self.assertEqual(stopped.exception.code, 5)
+
+
+class SessionLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.tg = load_tg(os.path.join(self.tmp, "state"))
+        self.api = FakeAPI()
+        setattr(self.tg, "api", self.api)
+
+    def tearDown(self):
+        for key in ("TG_CWD", "TG_KEY", "TG_SESSION_ID", "TG_SESSION_LEASE"):
+            os.environ.pop(key, None)
+        shutil.rmtree(self.tmp)
+
+    def _start(self, sid):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.tg.hook_sessionstart({"cwd": "/same/cwd", "session_id": sid})
+        return os.environ["TG_SESSION_LEASE"]
+
+    def test_running_listener_observes_sessionend(self):
+        sid = "live-session"
+        self._start(sid)
+        original_sleep = self.tg.time.sleep
+        self.tg.time.sleep = lambda _seconds: self.tg.hook_sessionend({
+            "cwd": "/same/cwd", "session_id": sid,
+        })
+        try:
+            with self.assertRaises(SystemExit) as stopped:
+                self.tg.cmd_listen(30)
+        finally:
+            self.tg.time.sleep = original_sleep
+        self.assertEqual(stopped.exception.code, 5)
+
+    def test_listener_does_not_poll_after_end_while_waiting_for_lock(self):
+        sid = "lock-race-session"
+        self._start(sid)
+        lifecycle = self
+
+        class EndSessionOnEnter:
+            def __enter__(self):
+                lifecycle.tg.hook_sessionend({
+                    "cwd": "/same/cwd", "session_id": sid,
+                })
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        original_lock = self.tg.Lock
+        self.tg.Lock = EndSessionOnEnter
+        self.api.calls.clear()
+        try:
+            with self.assertRaises(SystemExit) as stopped:
+                self.tg.cmd_listen(30)
+        finally:
+            self.tg.Lock = original_lock
+        self.assertEqual(stopped.exception.code, 5)
+        self.assertNotIn("getUpdates", self.api.calls)
+
+    def test_idlewatch_does_not_mirror_after_sessionend(self):
+        sid = "idle-session"
+        lease_id = self._start(sid)
+        config_path = os.path.join(self.tmp, "state", "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+        config["idle_mirror_secs"] = 15
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        original_sleep = self.tg.time.sleep
+        self.tg.time.sleep = lambda _seconds: self.tg.hook_sessionend({
+            "cwd": "/same/cwd", "session_id": sid,
+        })
+        try:
+            self.tg.cmd_idlewatch(sid, int(time.time()), "/same/cwd", lease_id)
+        finally:
+            self.tg.time.sleep = original_sleep
+        mirrored = [item for item in self.api.sent
+                    if "мин без ответа" in (item[1] or {}).get("text", "")]
+        self.assertEqual(mirrored, [])
+
+    def test_idlewatch_mirror_keeps_session_routing_key(self):
+        sid = "mirror-session"
+        lease_id = self._start(sid)
+        config_path = os.path.join(self.tmp, "state", "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+        config["idle_mirror_secs"] = 1
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+        for key in ("TG_KEY", "TG_SESSION_ID", "TG_SESSION_LEASE"):
+            os.environ.pop(key, None)
+
+        original_sleep = self.tg.time.sleep
+        self.tg.time.sleep = lambda _seconds: None
+        try:
+            self.tg.cmd_idlewatch(sid, int(time.time()), "/same/cwd", lease_id)
+        finally:
+            self.tg.time.sleep = original_sleep
+        self.assertEqual(self.tg.load_sentmap()[str(self.api._mid)], "mirror_session")
+
+    def test_same_cwd_sessions_have_distinct_routing_keys(self):
+        self._start("session-A")
+        first_mid = self.api._mid
+        self._start("session-B")
+        second_mid = self.api._mid
+        sent_map = self.tg.load_sentmap()
+        self.assertEqual(sent_map[str(first_mid)], "session_A")
+        self.assertEqual(sent_map[str(second_mid)], "session_B")
+
+    def test_resumed_generation_invalidates_old_listener(self):
+        sid = "resumed-session"
+        old_lease = self._start(sid)
+        new_lease = self._start(sid)
+        self.assertNotEqual(old_lease, new_lease)
+        os.environ["TG_KEY"] = "resumed_session"
+        os.environ["TG_SESSION_ID"] = "resumed_session"
+        os.environ["TG_SESSION_LEASE"] = old_lease
+        with self.assertRaises(SystemExit) as stopped:
+            self.tg.cmd_listen(30)
+        self.assertEqual(stopped.exception.code, 5)
+
+    def test_away_notification_keeps_session_routing_key(self):
+        sid = "notification-session"
+        self._start(sid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.tg.cmd_away("on", "/same/cwd")
+        self.tg.hook_notification({
+            "cwd": "/same/cwd", "session_id": sid, "message": "input needed",
+        })
+        self.assertEqual(self.tg.load_sentmap()[str(self.api._mid)],
+                         "notification_session")
+
+    def test_away_notification_is_suppressed_after_sessionend(self):
+        sid = "ended-notification-session"
+        self._start(sid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.tg.cmd_away("on", "/same/cwd")
+        self.tg.hook_sessionend({"cwd": "/same/cwd", "session_id": sid})
+        self.api.sent.clear()
+        self.tg.hook_notification({
+            "cwd": "/same/cwd", "session_id": sid, "message": "stale input",
+        })
+        self.assertEqual(self.api.sent, [])
+
+    def test_cli_listener_exits_5_for_ended_session(self):
+        sid = "process-session"
+        lease_id = self._start(sid)
+        self.tg.hook_sessionend({"cwd": "/same/cwd", "session_id": sid})
+        env = dict(os.environ, TG_STATE_DIR=os.path.join(self.tmp, "state"),
+                   TG_KEY="process_session", TG_SESSION_ID="process_session",
+                   TG_SESSION_LEASE=lease_id)
+        result = subprocess.run(
+            [sys.executable, TG_PY, "listen", "30"],
+            env=env, capture_output=True, text=True, timeout=2, check=False,
+        )
+        self.assertEqual(result.returncode, 5, result.stderr)
+
+    def test_session_state_is_versioned_json(self):
+        sid = "json-session"
+        lease_id = self._start(sid)
+        path = os.path.join(self.tmp, "state", "sessions.d", "json_session.json")
+        with open(path) as f:
+            active = json.load(f)
+        self.assertEqual(set(active), {
+            "lease_id", "schema_version", "session_id", "started_at", "status",
+        })
+        self.assertEqual(active["lease_id"], lease_id)
+        self.assertEqual(active["schema_version"], 1)
+        self.assertEqual(active["session_id"], "json_session")
+        self.assertEqual(active["status"], "active")
+        self.assertIsInstance(active["started_at"], int)
+
+        self.tg.hook_sessionend({"cwd": "/same/cwd", "session_id": sid})
+        with open(path) as f:
+            ended = json.load(f)
+        self.assertEqual(ended["status"], "ended")
+        self.assertEqual(ended["lease_id"], lease_id)
+        self.assertIsInstance(ended["ended_at"], int)
 
 
 if __name__ == "__main__":
