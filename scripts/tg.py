@@ -29,9 +29,7 @@ Exit codes: 0 ok (message printed), 2 config missing/invalid, 3 timeout/no-messa
 (relaunch once), 4 a listener for this session is already running (do nothing),
 5 the owning session ended (do not relaunch), 1 other.
 """
-import contextlib
 import fcntl
-import io
 import json
 import os
 import subprocess
@@ -594,6 +592,17 @@ def away_active(d):
 
 
 # ---------- hooks ----------
+def spawn_detached_send(text, thread=True):
+    """Fire-and-forget send in a detached child process. Hooks must never call
+    the Telegram API inline: a DNS/socket stall outlives the hook timeout and
+    Claude Code kills the hook, discarding its stdout — for SessionStart that
+    silently drops the always-listen context for the whole session."""
+    subprocess.Popen([sys.executable, SELF, "_bgsend", "1" if thread else "0", text],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True,
+                     env=dict(os.environ))
+
+
 def _read_hook_input():
     try:
         return json.load(sys.stdin)
@@ -659,9 +668,7 @@ def hook_notification(inp):
             return
         os.environ["TG_SESSION_LEASE"] = lease_id
     try:
-        cmd_send("🔔 " + msg)
-    except SystemExit:
-        pass
+        spawn_detached_send("🔔 " + msg)
     except Exception:
         pass
 
@@ -729,8 +736,9 @@ def hook_sessionstart(inp):
     if not c.get("chat_id") or not c.get("always_listen", False):
         return
     # Announce this session to Telegram ("I'm session X, now listening"). This
-    # message is also the reply-anchor for addressing this session. Suppress the
-    # command's stdout so it doesn't corrupt the hook's JSON output.
+    # message is also the reply-anchor for addressing this session. Sent from a
+    # detached process: the hook's own budget is 10s and must be spent printing
+    # the additionalContext, not waiting on the Telegram API.
     cwd = inp.get("cwd", "") or os.getcwd()
     label = os.path.basename(cwd) or cwd
     os.environ["TG_CWD"] = cwd
@@ -743,8 +751,7 @@ def hook_sessionstart(inp):
            "Слушаю Telegram. _Ответь реплаем на это сообщение, чтобы писать именно этой сессии._"
            % (label, sid[:8] or "?", cwd))
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            cmd_send(msg, thread=False)  # standalone announcement — never a reply
+        spawn_detached_send(msg, thread=False)  # standalone announcement — never a reply
     except Exception:
         pass
     # Pin the session key and lease in every command. TG_CWD remains the display
@@ -844,6 +851,8 @@ def main():
             handler(_read_hook_input())
     elif cmd == "_idlewatch":
         cmd_idlewatch(a[1], int(a[2]), a[3], a[4] if len(a) > 4 else "")
+    elif cmd == "_bgsend":
+        cmd_send(a[2] if len(a) > 2 else "", thread=(len(a) > 1 and a[1] == "1"))
     else:
         die("unknown command: %s" % cmd)
 

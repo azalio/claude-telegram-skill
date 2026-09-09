@@ -40,6 +40,13 @@ def load_tg(state_dir):
     assert spec and spec.loader
     tg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tg)
+
+    # In production hooks send via a detached child process (spawn_detached_send);
+    # in tests run the send synchronously through the in-process (mockable) api.
+    def _sync_send(text, thread=True):
+        with contextlib.redirect_stdout(io.StringIO()):
+            tg.cmd_send(text, thread=thread)
+    setattr(tg, "spawn_detached_send", _sync_send)
     return tg
 
 
@@ -345,6 +352,39 @@ class HelperTests(unittest.TestCase):
         self.assertIn("Telegram always-listen is ON", hso["additionalContext"])
         self.assertIn("run_in_background", hso["additionalContext"])
 
+    def test_sessionstart_never_calls_api_inline(self):
+        # Regression: a DNS/socket stall in the announcement used to eat the
+        # hook's 10s budget — Claude Code killed the hook and discarded the
+        # additionalContext, silently disabling always-listen for the session.
+        calls = []
+        setattr(self.tg, "spawn_detached_send",
+                lambda text, thread=True: calls.append((text, thread)))
+
+        def boom(*_a, **_k):
+            raise AssertionError("hook called the Telegram API inline")
+        setattr(self.tg, "api", boom)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.tg.hook_sessionstart({"cwd": "/Users/x/proj", "session_id": "hangproof"})
+        hso = json.loads(buf.getvalue())["hookSpecificOutput"]
+        self.assertIn("Telegram always-listen is ON", hso["additionalContext"])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0][1])       # standalone announcement — never a reply
+
+    def test_bgsend_dispatch_sends_standalone(self):
+        os.environ["TG_KEY"] = "bg_test"
+        argv = sys.argv
+        sys.argv = ["tg.py", "_bgsend", "0", "standalone announce"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.tg.main()
+        finally:
+            sys.argv = argv
+        method, params, _files = self.api.sent[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertNotIn("reply_to_message_id", params)
+        self.assertIn("standalone announce", params["text"])
+
     def test_sessionend_stops_listener_generation(self):
         sid = "session-123"
         buf = io.StringIO()
@@ -409,13 +449,13 @@ class SessionLifecycleTests(unittest.TestCase):
                 return None
 
         original_lock = self.tg.Lock
-        self.tg.Lock = EndSessionOnEnter
+        setattr(self.tg, "Lock", EndSessionOnEnter)
         self.api.calls.clear()
         try:
             with self.assertRaises(SystemExit) as stopped:
                 self.tg.cmd_listen(30)
         finally:
-            self.tg.Lock = original_lock
+            setattr(self.tg, "Lock", original_lock)
         self.assertEqual(stopped.exception.code, 5)
         self.assertNotIn("getUpdates", self.api.calls)
 
@@ -492,6 +532,23 @@ class SessionLifecycleTests(unittest.TestCase):
         })
         self.assertEqual(self.tg.load_sentmap()[str(self.api._mid)],
                          "notification_session")
+
+    def test_notification_never_calls_api_inline(self):
+        sid = "detached-notification-session"
+        self._start(sid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.tg.cmd_away("on", "/same/cwd")
+        calls = []
+        setattr(self.tg, "spawn_detached_send",
+                lambda text, thread=True: calls.append((text, thread)))
+
+        def boom(*_a, **_k):
+            raise AssertionError("hook called the Telegram API inline")
+        setattr(self.tg, "api", boom)
+        self.tg.hook_notification({
+            "cwd": "/same/cwd", "session_id": sid, "message": "input needed",
+        })
+        self.assertEqual(calls, [("🔔 input needed", True)])
 
     def test_away_notification_is_suppressed_after_sessionend(self):
         sid = "ended-notification-session"
